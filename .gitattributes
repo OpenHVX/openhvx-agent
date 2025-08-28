@@ -1,22 +1,9 @@
-# Canon: LF dans le repo
 * text=auto eol=lf
 
-# Go
-*.go     text eol=lf
-go.mod   text eol=lf
-go.sum   text eol=lf
+*.go linguist-language=Go
+go.mod linguist-language=Go
+go.sum linguist-language=Go
 
-# Node/JS/Configs
-*.js     text eol=lf
-*.ts     text eol=lf
-*.json   text eol=lf
-*.yml    text eol=lf
-*.yaml   text eol=lf
-Dockerfile text eol=lf
-*.sh     text eol=lf
-
-# Scripts Windows en CRLF (si tu en as)
-*.ps1    text eol=crlf
-*.psm1   text eol=crlf
-*.bat    text eol=crlf
-*.cmd    text eol=crlf
+*.ps1  linguist-detectable=false
+*.psm1 linguist-detectable=false
+*.psd1 linguist-detectable=false
