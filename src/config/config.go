@@ -11,6 +11,7 @@ type Config struct {
 	HeartbeatIntervalSec int      `json:"heartbeatIntervalSec"` // ex: 30
 	InventoryIntervalSec int      `json:"inventoryIntervalSec"` // ex: 60
 	Capabilities         []string `json:"capabilities"`         // ex: ["inventory","vm.power"]
+	BasePath             string   `json:"basePath"`             // ex: "C:\\Hyper-V"
 }
 
 func Load(path string) (*Config, error) {

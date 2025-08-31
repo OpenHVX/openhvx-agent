@@ -1,19 +1,99 @@
 # powershell/actions/inventory.refresh.ps1
-# Sortie: objet JSON "inventory" complet (STDOUT)
-# Dépendances: Module Hyper-V, NetAdapter/NetTCPIP, Storage
+# Sortie: objet JSON { ok, result, error }
+# - result.inventory  : inventaire Hyper-V (host, réseaux, stockage, VMs)
+# - result.datastores : tableau des "datastores" (path -> drive, totalBytes, freeBytes)
+# Paramètres d'entrée (via -InputJson ou STDIN):
+# 1) Nouveau (préféré, injecté par l'agent pour les tâches):
+# {
+#   "__ctx": {
+#     "agentId": "HOST-XXX",
+#     "tenantId": "TEN-123",
+#     "basePath": "C:\\Hyper-V",
+#     "paths": { "root":"C:\\Hyper-V\\openhvx", "vms":"...", "vhd":"...", "isos":"...", "checkpoints":"...", "logs":"...", "trash":"..." },
+#     "datastores": [ {"name":"OpenHVX VMS","kind":"vm","path":"C:\\Hyper-V\\openhvx\\VMS"}, ... ]
+#   }
+#   // + éventuels autres champs spécifiques
+# }
+# 2) Ancien (fallback pour l'inventaire périodique):
+# {
+#   "basePath": "C:\\Hyper-V",
+#   "datastores": [ ... ]
+# }
+
+param(
+  [string]$InputJson
+)
 
 $ErrorActionPreference = 'Stop'
 
+# ===================== Helpers entrée JSON (arg ou STDIN) =====================
+function Read-ParamsJson {
+  param([string]$Inline)
+
+  if ($Inline) {
+    try { return ($Inline | ConvertFrom-Json -ErrorAction Stop) } catch {}
+  }
+
+  # Lecture STDIN (si l'agent envoie le JSON via STDIN)
+  $stdinLines = @()
+  foreach ($line in $input) { $stdinLines += $line }
+  if ($stdinLines.Count -gt 0) {
+    $text = ($stdinLines -join "`n")
+    try { return ($text | ConvertFrom-Json -ErrorAction Stop) } catch {}
+  }
+
+  return @{}
+}
+
+# ===================== Helpers génériques =====================
 function _MB($bytes) {
   if ($null -eq $bytes) { return $null }
   return [int]([math]::Round($bytes / 1MB))
 }
 
-function Get-HostInfo {
-  try {
-    $ci = Get-ComputerInfo
+function Get-DriveUsage {
+  param([string]$Path)
+  if (-not $Path) {
+    return @{ drive = $null; totalBytes = 0; freeBytes = 0 }
   }
-  catch { $ci = $null }
+
+  $drive = $null
+  try { $drive = [System.IO.Path]::GetPathRoot($Path) } catch {}
+  if (-not $drive) {
+    try { $drive = (Split-Path -Path $Path -Qualifier) } catch {}
+  }
+
+  try {
+    $di = New-Object System.IO.DriveInfo ($drive)
+    return @{
+      drive      = $drive
+      totalBytes = [uint64]$di.TotalSize
+      freeBytes  = [uint64]$di.AvailableFreeSpace
+    }
+  }
+  catch {
+    # UNC / contextes restreints : renvoie 0 plutôt que d'échouer
+    return @{ drive = $drive; totalBytes = 0; freeBytes = 0 }
+  }
+}
+
+function Build-DefaultDatastores {
+  param([string]$BasePath)
+  if (-not $BasePath) { return @() }
+  $root = Join-Path $BasePath 'openhvx'
+  return @(
+    @{ name = 'OpenHVX Root'; kind = 'root'; path = (Join-Path $root '') },
+    @{ name = 'OpenHVX VMS'; kind = 'vm'; path = (Join-Path $root 'VMS') },
+    @{ name = 'OpenHVX VHD'; kind = 'vhd'; path = (Join-Path $root 'VHD') },
+    @{ name = 'OpenHVX ISOs'; kind = 'iso'; path = (Join-Path $root 'ISOs') },
+    @{ name = 'Checkpoints'; kind = 'checkpoint'; path = (Join-Path $root 'Checkpoints') },
+    @{ name = 'Logs'; kind = 'logs'; path = (Join-Path $root 'Logs') }
+  )
+}
+
+# ===================== Collecte HOST =====================
+function Get-HostInfo {
+  try { $ci = Get-ComputerInfo } catch { $ci = $null }
 
   $cpu = $null
   try {
@@ -56,6 +136,7 @@ function Get-HostInfo {
   }
 }
 
+# ===================== Réseau / vSwitch =====================
 function Get-HostAdapters {
   $adapters = @()
   try {
@@ -73,10 +154,7 @@ function Get-HostAdapters {
       }
       catch {}
       $dns = @()
-      try {
-        $dns = (Get-DnsClientServerAddress -InterfaceIndex $ifx.ifIndex -ErrorAction Stop).ServerAddresses
-      }
-      catch {}
+      try { $dns = (Get-DnsClientServerAddress -InterfaceIndex $ifx.ifIndex -ErrorAction Stop).ServerAddresses } catch {}
       [pscustomobject]@{
         name       = $ifx.Name
         interface  = $ifx.InterfaceDescription
@@ -99,18 +177,11 @@ function Get-VSwitches {
     $switches = Get-VMSwitch | ForEach-Object {
       $sw = $_
       $uplinks = @()
-      # Uplink(s) physiques pour switch "External"
       if ($sw.SwitchType -eq 'External') {
-        try {
-          $uplinks = (Get-VMSwitch -Name $sw.Name).NetAdapterInterfaceDescriptions
-        }
-        catch {}
+        try { $uplinks = (Get-VMSwitch -Name $sw.Name).NetAdapterInterfaceDescriptions } catch {}
       }
       $ext = @()
-      try {
-        $ext = Get-VMSwitchExtension -VMSwitchName $sw.Name | Select-Object Name, Vendor, ExtensionType, Enabled
-      }
-      catch {}
+      try { $ext = Get-VMSwitchExtension -VMSwitchName $sw.Name | Select-Object Name, Vendor, ExtensionType, Enabled } catch {}
 
       [pscustomobject]@{
         name          = $sw.Name
@@ -127,9 +198,21 @@ function Get-VSwitches {
   return , $switches
 }
 
+function Map-VSwitchToHostAdapters {
+  param($switches, $hostAdapters)
+  foreach ($sw in $switches) {
+    if ($sw.type -eq 'External' -and $sw.uplinks) {
+      foreach ($upl in $sw.uplinks) {
+        $match = $hostAdapters | Where-Object { $_.interface -eq $upl }
+        foreach ($m in $match) { $m.switchName = $sw.name }
+      }
+    }
+  }
+}
+
+# ===================== Stockage hôte =====================
 function Get-StorageInventory {
-  $disks = @()
-  $vols = @()
+  $disks = @(); $vols = @()
   try {
     $disks = Get-Disk | ForEach-Object {
       [pscustomobject]@{
@@ -166,13 +249,13 @@ function Get-StorageInventory {
   }
 }
 
+# ===================== VMs =====================
 function Get-VM-NICs {
   param([string]$VmName)
   $items = @()
   try {
     $nics = Get-VMNetworkAdapter -VMName $VmName -ErrorAction Stop
     foreach ($n in $nics) {
-      # VLAN
       $vlanObj = $null
       try {
         $vlan = Get-VMNetworkAdapterVlan -VMNetworkAdapter $n
@@ -193,11 +276,7 @@ function Get-VM-NICs {
         }
       }
       catch {}
-
-      # IPs (si IC + VM up)
-      $ips = @()
-      try { $ips = $n.IPAddresses } catch {}
-
+      $ips = @(); try { $ips = $n.IPAddresses } catch {}
       $items += [pscustomobject]@{
         name       = $n.Name
         switch     = $n.SwitchName
@@ -220,10 +299,7 @@ function Get-VM-Disks {
     $hdds = Get-VMHardDiskDrive -VMName $VmName
     foreach ($h in $hdds) {
       $vhd = $null
-      try {
-        if ($h.Path) { $vhd = Get-VHD -Path $h.Path }
-      }
-      catch {}
+      try { if ($h.Path) { $vhd = Get-VHD -Path $h.Path } } catch {}
       $items += [pscustomobject]@{
         controllerType   = "$($h.ControllerType)"     # IDE/SCSI
         controllerNumber = $h.ControllerNumber
@@ -289,10 +365,7 @@ function Get-VM-Config {
       $f = Get-VMFirmware -VMName $VmName
       if ($f) {
         $bootOrder = @()
-        try {
-          $bootOrder = $f.BootOrder | ForEach-Object { $_.Device | ForEach-Object { $_.ToString() } }
-        }
-        catch {}
+        try { $bootOrder = $f.BootOrder | ForEach-Object { $_.Device | ForEach-Object { $_.ToString() } } } catch {}
         $fw = [pscustomobject]@{
           secureBootEnabled            = $f.SecureBoot
           secureBootTemplate           = $f.SecureBootTemplate
@@ -349,11 +422,8 @@ function Get-VMList {
       $disks = Get-VM-Disks -VmName $v.Name
       $cfg = Get-VM-Config -VmName $v.Name -Generation $v.Generation
 
-      $checkpoints = @()
-      try {
-        $checkpoints = Get-VMCheckpoint -VM $v | Select-Object -Property SnapshotType, Name, CreationTime
-      }
-      catch {}
+      $checks = @()
+      try { $checks = Get-VMCheckpoint -VM $v | Select-Object -Property SnapshotType, Name, CreationTime } catch {}
 
       $list += [pscustomobject]@{
         name             = $v.Name
@@ -368,7 +438,7 @@ function Get-VMList {
         configuration    = $cfg
         networkAdapters  = $nics
         storage          = $disks
-        checkpoints      = $checkpoints
+        checkpoints      = $checks
       }
     }
   }
@@ -376,25 +446,33 @@ function Get-VMList {
   return , $list
 }
 
-# --- Lier les vSwitch externes aux NICs hôte (switchName sur hostAdapters) ---
-function Map-VSwitchToHostAdapters {
-  param($switches, $hostAdapters)
-  foreach ($sw in $switches) {
-    if ($sw.type -eq 'External' -and $sw.uplinks) {
-      foreach ($upl in $sw.uplinks) {
-        # on matche par description d'interface (approx)
-        $match = $hostAdapters | Where-Object { $_.interface -eq $upl }
-        foreach ($m in $match) { $m.switchName = $sw.name }
-      }
+# ===================== MAIN =====================
+try {
+  # 1) Lire les paramètres (arg ou STDIN) + extraire le contexte
+  $Params = Read-ParamsJson -Inline $InputJson
+  $ctx = $Params.__ctx
+
+  # Préférence: __ctx (injecté par l'agent pour les tasks)
+  $basePath = $null
+  $datastores = $null
+
+  if ($ctx) {
+    if ($ctx.basePath) { $basePath = $ctx.basePath }
+    if ($ctx.datastores) { $datastores = $ctx.datastores }
+    # si pas de datastores mais des paths normés, on peut reconstruire un défaut
+    if (-not $datastores -and $ctx.paths -and $ctx.paths.root) {
+      $datastores = Build-DefaultDatastores -BasePath (Split-Path -Path $ctx.paths.root -Parent)
     }
   }
-}
 
-# --- MAIN ---
-try {
-  # on lit l'entrée (pour compat) mais on ne s'en sert pas
-  $null = [Console]::In.ReadToEnd()
+  # Fallback compat (inventaire périodique appelle encore basePath/datastores)
+  if (-not $basePath -and $Params.basePath) { $basePath = $Params.basePath }
+  if (-not $datastores -and $Params.datastores) { $datastores = $Params.datastores }
 
+  if (-not $datastores -and $basePath) { $datastores = Build-DefaultDatastores -BasePath $basePath }
+  if (-not $datastores) { $datastores = @() }
+
+  # 2) Inventaire Hyper-V
   $hostInfo = Get-HostInfo
   $switches = Get-VSwitches
   $adapters = Get-HostAdapters
@@ -413,14 +491,38 @@ try {
     collectedAt = (Get-Date).ToUniversalTime().ToString("o")
   }
 
-  $inventory | ConvertTo-Json -Depth 12 -Compress
+  # 3) Datastores -> capacité/ libre
+  $dsOut = @()
+  foreach ($ds in $datastores) {
+    $p = [string]$ds.path
+    if (-not $p) { continue }
+    $u = Get-DriveUsage -Path $p
+    $dsOut += [ordered]@{
+      name       = $ds.name
+      kind       = $ds.kind
+      path       = $p
+      drive      = $u.drive
+      totalBytes = $u.totalBytes
+      freeBytes  = $u.freeBytes
+    }
+  }
+
+  # 4) Sortie finale { ok, result, error }
+  [pscustomobject]@{
+    ok     = $true
+    result = [pscustomobject]@{
+      inventory  = $inventory
+      datastores = $dsOut
+    }
+    error  = $null
+  } | ConvertTo-Json -Depth 12
   exit 0
 }
 catch {
-  # En cas d'erreur globale, on remonte un objet de diagnostic
   [pscustomobject]@{
+    ok    = $false
     error = $_.Exception.Message
     where = $_.InvocationInfo.PositionMessage
-  } | ConvertTo-Json -Compress
+  } | ConvertTo-Json -Depth 6
   exit 1
 }

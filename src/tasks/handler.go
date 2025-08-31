@@ -5,27 +5,33 @@ import (
 	"fmt"
 	"log"
 
-	"hvwm-agent/amqp"       // adapte
-	"hvwm-agent/powershell" // adapte
+	"openhvx-agent/amqp"
+	"openhvx-agent/powershell"
 )
 
 func HandleTask(t amqp.Task) (any, error) {
-	log.Printf("[TASK] action=%s taskId=%s", t.Action, t.TaskID)
+	log.Printf("[TASK] action=%s taskId=%s tenant=%s", t.Action, t.TaskID, t.TenantID)
 
-	raw, err := powershell.RunActionScript(t.Action, t.Data)
+	// 1) Merge des params: on ajoute __ctx sans écraser les clés métier
+	merged := make(map[string]any, len(t.Data)+1)
+	for k, v := range t.Data {
+		merged[k] = v
+	}
+	merged["__ctx"] = ctxMap(t.TenantID) // ⬅️ CONTEXTE STANDARD
 
-	// Essaye toujours d’unmarshal le stdout
+	// 2) Exécuter le script
+	raw, err := powershell.RunActionScript(t.Action, merged)
+
+	// 3) Toujours essayer d’unmarshal
 	var obj any
 	if uErr := json.Unmarshal(raw, &obj); uErr == nil {
-		// on a un JSON valide
 		if err != nil {
-			// script a échoué -> on garde le JSON ET l’erreur
 			return obj, fmt.Errorf("action script failed")
 		}
 		return obj, nil
 	}
 
-	// si stdout pas JSON, renvoyer brut
+	// 4) Sinon renvoyer stdout brut + statut ok/ko
 	if err != nil {
 		return map[string]any{"ok": false, "raw": string(raw)}, fmt.Errorf("action script failed")
 	}

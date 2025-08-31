@@ -1,4 +1,4 @@
-module hvwm-agent
+module openhvx-agent
 
 go 1.25.0
 

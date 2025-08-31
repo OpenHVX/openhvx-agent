@@ -12,8 +12,11 @@ import (
 	"strings"
 )
 
-// RunActionScript exécute powershell/actions/<action>.ps1 en passant le task JSON sur STDIN.
-// action : ex. "vm.power", "inventory.refresh"
+// RunActionScript exécute powershell/actions/<action>.ps1.
+//
+// - Passe les "data" (map) en JSON via l'argument nommé: -InputJson '<json>'.
+// - En parallèle, envoie sur STDIN un wrapper { "action": "<action>", "data": {...} } pour compatibilité.
+// - Si le script ne connaît pas -InputJson, on retente automatiquement sans ce paramètre.
 func RunActionScript(action string, data map[string]any) ([]byte, error) {
 	ps, err := findPwsh()
 	if err != nil {
@@ -25,27 +28,69 @@ func RunActionScript(action string, data map[string]any) ([]byte, error) {
 		return nil, err
 	}
 
-	task := map[string]any{"action": action, "data": data}
-	payload, _ := json.Marshal(task)
+	// JSON des "data" (pour -InputJson)
+	dataOnlyJSON, _ := json.Marshal(data)
 
-	cmd := exec.Command(ps, "-ExecutionPolicy", "Bypass", "-NoProfile", "-File", scriptPath)
-	cmd.Stdin = bytes.NewReader(payload)
+	// Payload STDIN compat: { action, data }
+	task := map[string]any{"action": action, "data": data}
+	stdinPayload, _ := json.Marshal(task)
+
+	// Tentative 1: avec -InputJson
+	args := []string{"-ExecutionPolicy", "Bypass", "-NoProfile", "-File", scriptPath, "-InputJson", string(dataOnlyJSON)}
+	out, stderr, runErr := runPwsh(ps, args, stdinPayload)
+	if runErr == nil {
+		return out, nil
+	}
+
+	// Si l'erreur mentionne un paramètre inconnu (-InputJson), on retente sans
+	if isUnknownParamError(stderr, "InputJson") {
+		args2 := []string{"-ExecutionPolicy", "Bypass", "-NoProfile", "-File", scriptPath}
+		out2, stderr2, runErr2 := runPwsh(ps, args2, stdinPayload)
+		if runErr2 == nil {
+			return out2, nil
+		}
+		// Echec 2: si le script a tout de même produit un JSON utile, on le renvoie avec une erreur générique
+		if len(out2) > 0 {
+			return out2, errors.New("action script failed")
+		}
+		return nil, errors.New("action script failed: " + strings.TrimSpace(string(stderr2)))
+	}
+
+	// Echec 1 "classique"
+	if len(out) > 0 {
+		return out, errors.New("action script failed")
+	}
+	return nil, errors.New("action script failed: " + strings.TrimSpace(string(stderr)))
+}
+
+func runPwsh(ps string, args []string, stdin []byte) ([]byte, []byte, error) {
+	cmd := exec.Command(ps, args...)
+	if len(stdin) > 0 {
+		cmd.Stdin = bytes.NewReader(stdin)
+	}
 
 	var out, stderr bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &stderr
 
-	if err := cmd.Run(); err != nil {
-		if out.Len() > 0 {
-			// garder le JSON du script même si exit 1
-			return out.Bytes(), errors.New("action script failed")
-		}
-		return nil, errors.New("action script failed: " + strings.TrimSpace(stderr.String()))
+	err := cmd.Run()
+	if err != nil {
+		// On renvoie quand même stdout/stderr pour analyse
+		return out.Bytes(), stderr.Bytes(), err
 	}
 	if out.Len() == 0 {
-		return nil, errors.New("empty action output")
+		return nil, nil, errors.New("empty action output")
 	}
-	return out.Bytes(), nil
+	return out.Bytes(), stderr.Bytes(), nil
+}
+
+func isUnknownParamError(stderr []byte, param string) bool {
+	// Exemples de messages:
+	// "A parameter cannot be found that matches parameter name 'InputJson'."
+	// "Un paramètre ne peut pas être trouvé qui correspond au nom du paramètre « InputJson »."
+	s := strings.ToLower(string(stderr))
+	return strings.Contains(s, "parameter cannot be found") &&
+		strings.Contains(s, strings.ToLower(param))
 }
 
 func resolveActionScript(action string) (string, error) {

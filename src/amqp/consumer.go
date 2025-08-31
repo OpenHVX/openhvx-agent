@@ -10,10 +10,16 @@ import (
 	amqp091 "github.com/rabbitmq/amqp091-go"
 )
 
+// AfterResult est un hook optionnel appelé juste après la publication du résultat.
+// Laisse-le à nil si tu ne veux rien faire après les tasks.
+// C'est le binaire agent (main) qui peut affecter: amqp.AfterResult = func(t Task){ ... }
+var AfterResult func(Task)
+
 type Task struct {
 	TaskID        string                 `json:"taskId,omitempty"`
 	AgentID       string                 `json:"agentId,omitempty"`
 	Action        string                 `json:"action"`
+	TenantID      string                 `json:"tenantId,omitempty"` // présent pour d'autres usages, l'inventaire reste tenant-agnostic
 	Data          map[string]interface{} `json:"data,omitempty"`
 	ReplyTo       string                 `json:"replyTo,omitempty"`
 	CorrelationID string                 `json:"correlationId,omitempty"`
@@ -143,6 +149,11 @@ func StartTaskConsumer(agentID string, handle HandlerFunc) error {
 				); err != nil {
 					log.Printf("[AMQP] publish result (replyTo) error: %v", err)
 				}
+			}
+
+			// ---- Hook post-publication (ex: déclencher inventory.refresh.light) ----
+			if AfterResult != nil {
+				go AfterResult(t) // non bloquant
 			}
 		}
 		log.Printf("[AMQP] consumer stopped for %s", queueName)

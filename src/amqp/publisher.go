@@ -67,14 +67,16 @@ type heartbeat struct {
 	Version      string   `json:"version"`
 	AgentID      string   `json:"agentId"`
 	Timestamp    string   `json:"ts"`
+	Host         string   `json:"host"`
 	Capabilities []string `json:"capabilities"`
 }
 
 // PublishHeartbeat envoie un heartbeat sans notion de tenant.
-func PublishHeartbeat(agentID string, caps []string) error {
+func PublishHeartbeat(agentID string, host string, caps []string) error {
 	hb := heartbeat{
 		Version:      "0.1.0",
 		AgentID:      agentID,
+		Host:         host,
 		Timestamp:    time.Now().UTC().Format(time.RFC3339),
 		Capabilities: caps,
 	}
@@ -109,7 +111,7 @@ func PublishInventoryJSON(agentID string, invJSON []byte) error {
 	body, _ := json.Marshal(env)
 	rk := "inventory." + agentID
 
-	log.Println("[AMQP] Publishing inventory to", TelemetryEx, "rk=", rk)
+	log.Println("[AMQP] Publishing inventory (FULL) to", TelemetryEx, "rk=", rk)
 
 	return ch.Publish(
 		TelemetryEx, rk,
@@ -118,6 +120,66 @@ func PublishInventoryJSON(agentID string, invJSON []byte) error {
 		amqp091.Publishing{
 			ContentType:  "application/json",
 			DeliveryMode: amqp091.Persistent,
+			Body:         body,
+		},
+	)
+}
+
+// ======= ⬇️ Manquait : définition du type d'options pour WithMeta ⬇️
+type InventoryPublishOpts struct {
+	AgentID   string
+	Body      []byte
+	Source    string            // ex: "inventory.refresh.light"
+	MergeMode string            // "patch-nondestructive" | "replace" | "raw"
+	Headers   map[string]string // optionnel
+}
+
+// ======= ⬆️ Fin du bloc manquant ⬆️
+
+type inventoryEnvelopeMeta struct {
+	AgentID   string          `json:"agentId"`
+	Timestamp string          `json:"ts"`
+	Source    string          `json:"source,omitempty"`    // ex: inventory.refresh.light
+	MergeMode string          `json:"mergeMode,omitempty"` // ex: patch-nondestructive
+	Inventory json.RawMessage `json:"inventory"`           // { inventory, datastores }
+}
+
+func PublishInventoryJSONWithMeta(opts InventoryPublishOpts) error {
+	if ch == nil {
+		return fmt.Errorf("AMQP channel not initialized")
+	}
+	// Harmonisation: même topic pattern que PublishInventoryJSON
+	rk := "inventory." + opts.AgentID
+
+	// Enveloppe uniforme (agentId + horodatage)
+	env := inventoryEnvelopeMeta{
+		AgentID:   opts.AgentID,
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+		Source:    opts.Source,
+		MergeMode: opts.MergeMode,
+		Inventory: json.RawMessage(opts.Body), // Body = { inventory, datastores }
+	}
+	body, _ := json.Marshal(env)
+
+	// Headers optionnels
+	h := amqp091.Table{
+		"x-source":     opts.Source,
+		"x-merge-mode": opts.MergeMode,
+	}
+	for k, v := range opts.Headers {
+		h[k] = v
+	}
+
+	log.Println("[AMQP] Publishing inventory (LIGHT) to", TelemetryEx, "rk=", rk)
+
+	return ch.Publish(
+		TelemetryEx, rk,
+		true,  // mandatory
+		false, // immediate
+		amqp091.Publishing{
+			ContentType:  "application/json",
+			DeliveryMode: amqp091.Persistent,
+			Headers:      h,
 			Body:         body,
 		},
 	)
