@@ -71,5 +71,6 @@ temp/
 *.swp
 *.swo
 
-
+# --- exe
+*.exe
 config.json

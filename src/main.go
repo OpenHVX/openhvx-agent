@@ -2,7 +2,7 @@
 package main
 
 import (
-	"context" // ⬅️ NEW
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -35,7 +35,7 @@ func buildDatastoresParam(d datadirs.DataDirs) []map[string]string {
 		{"name": "OpenHVX Root", "kind": "root", "path": d.Root},
 		{"name": "OpenHVX VMS", "kind": "vm", "path": d.VMS},
 		{"name": "OpenHVX VHD", "kind": "vhd", "path": d.VHD},
-		{"name": "OpenHVX ISOs", "kind": "iso", "path": d.ISOs},
+		{"name": "OpenHVX ISOs", "kind": "iso", "path": d.ISOs}, // legacy/compat
 		{"name": "Checkpoints", "kind": "checkpoint", "path": d.Checkpoints},
 		{"name": "Logs", "kind": "logs", "path": d.Logs},
 	}
@@ -77,7 +77,7 @@ func main() {
 
 			dsParam := buildDatastoresParam(dirs)
 
-			// Passe basePath + datastores au script inventory.refresh
+			// Passe basePath + datastores + images au script inventory.refresh
 			raw, err := powershell.RunActionScript("inventory.refresh", map[string]any{
 				"basePath":   cfg.BasePath,
 				"datastores": dsParam,
@@ -153,6 +153,7 @@ func main() {
 			AgentID:    cfg.AgentID,
 			BasePath:   cfg.BasePath,
 			DataStores: dsParam,
+			// light refresh = pas besoin d'images ici (on reste léger)
 		})
 	}
 
@@ -180,7 +181,9 @@ func main() {
 		t := time.NewTicker(invEvery)
 		defer t.Stop()
 		for range t.C {
-			// Passe basePath + datastores au script
+			// Lister les images dispo (peut être vide)
+
+			// Passe basePath + datastores + images au script
 			raw, err := powershell.RunActionScript("inventory.refresh", map[string]any{
 				"basePath":   cfg.BasePath,
 				"datastores": dsParam,

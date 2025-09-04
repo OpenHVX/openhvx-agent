@@ -1,7 +1,8 @@
 # powershell/actions/inventory.refresh.ps1
 # Sortie: objet JSON { ok, result, error }
-# - result.inventory  : inventaire Hyper-V (host, réseaux, stockage, VMs)
-# - result.datastores : tableau des "datastores" (path -> drive, totalBytes, freeBytes)
+# - result.inventory.inventory  : inventaire Hyper-V (host, réseaux, stockage, VMs)
+# - result.inventory.datastores : tableau des "datastores" (path -> drive, totalBytes, freeBytes)
+# - result.inventory.images     : catalogue d'images (fourni par l'agent)
 # Paramètres d'entrée (via -InputJson ou STDIN):
 # 1) Nouveau (préféré, injecté par l'agent pour les tâches):
 # {
@@ -10,14 +11,16 @@
 #     "tenantId": "TEN-123",
 #     "basePath": "C:\\Hyper-V",
 #     "paths": { "root":"C:\\Hyper-V\\openhvx", "vms":"...", "vhd":"...", "isos":"...", "checkpoints":"...", "logs":"...", "trash":"..." },
-#     "datastores": [ {"name":"OpenHVX VMS","kind":"vm","path":"C:\\Hyper-V\\openhvx\\VMS"}, ... ]
+#     "datastores": [ {"name":"OpenHVX VMS","kind":"vm","path":"C:\\Hyper-V\\openhvx\\VMS"}, ... ],
+#     "images": [ { "id":"...", "filename":"...", "path":"...", "sizeBytes":123, "mtime":"...", "osGuess":"...", "archGuess":"x86_64", "gen":2, "readOnly":true } ]
 #   }
 #   // + éventuels autres champs spécifiques
 # }
 # 2) Ancien (fallback pour l'inventaire périodique):
 # {
 #   "basePath": "C:\\Hyper-V",
-#   "datastores": [ ... ]
+#   "datastores": [ ... ],
+#   "images": [ ... ]   // optionnel
 # }
 
 param(
@@ -455,24 +458,28 @@ try {
   # Préférence: __ctx (injecté par l'agent pour les tasks)
   $basePath = $null
   $datastores = $null
+  $imagesIn = @()
 
   if ($ctx) {
     if ($ctx.basePath) { $basePath = $ctx.basePath }
     if ($ctx.datastores) { $datastores = $ctx.datastores }
+    if ($ctx.images) { $imagesIn = $ctx.images }
     # si pas de datastores mais des paths normés, on peut reconstruire un défaut
     if (-not $datastores -and $ctx.paths -and $ctx.paths.root) {
       $datastores = Build-DefaultDatastores -BasePath (Split-Path -Path $ctx.paths.root -Parent)
     }
   }
 
-  # Fallback compat (inventaire périodique appelle encore basePath/datastores)
+  # Fallback compat (inventaire périodique appelle encore basePath/datastores/images)
   if (-not $basePath -and $Params.basePath) { $basePath = $Params.basePath }
   if (-not $datastores -and $Params.datastores) { $datastores = $Params.datastores }
+  if ($Params.images) { $imagesIn = $Params.images }
 
   if (-not $datastores -and $basePath) { $datastores = Build-DefaultDatastores -BasePath $basePath }
   if (-not $datastores) { $datastores = @() }
+  if (-not $imagesIn) { $imagesIn = @() }
 
-  # 2) Inventaire Hyper-V
+  # 2) Inventaire Hyper-V (branche "inventory.inventory")
   $hostInfo = Get-HostInfo
   $switches = Get-VSwitches
   $adapters = Get-HostAdapters
@@ -480,7 +487,7 @@ try {
   $storage = Get-StorageInventory
   $vms = Get-VMList
 
-  $inventory = [pscustomobject]@{
+  $inventoryStruct = [pscustomobject]@{
     host        = $hostInfo
     networks    = [pscustomobject]@{
       switches     = $switches
@@ -491,7 +498,7 @@ try {
     collectedAt = (Get-Date).ToUniversalTime().ToString("o")
   }
 
-  # 3) Datastores -> capacité/ libre
+  # 3) Datastores -> capacité/ libre (branche "inventory.datastores")
   $dsOut = @()
   foreach ($ds in $datastores) {
     $p = [string]$ds.path
@@ -506,15 +513,11 @@ try {
       freeBytes  = $u.freeBytes
     }
   }
-
   # 4) Sortie finale { ok, result, error }
+  #    IMPORTANT: on regroupe sous result.inventory.{ inventory, datastores, images }
   [pscustomobject]@{
-    ok     = $true
-    result = [pscustomobject]@{
-      inventory  = $inventory
-      datastores = $dsOut
-    }
-    error  = $null
+    inventory  = $inventoryStruct
+    datastores = $dsOut
   } | ConvertTo-Json -Depth 12
   exit 0
 }

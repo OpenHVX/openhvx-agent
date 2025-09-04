@@ -185,7 +185,7 @@ function Get-VHD-LightInfo {
     return [pscustomobject]@{
         format             = $fmt
         type               = $null
-        sizeMB             = $fileSizeMB
+        sizeMB             = $null
         fileSizeMB         = $fileSizeMB
         parentPath         = $null
         blockSize          = $null
@@ -364,15 +364,11 @@ try {
             freeBytes  = $u.freeBytes
         }
     }
-
     [pscustomobject]@{
-        ok     = $true
-        result = [pscustomobject]@{
-            inventory  = $inventory
-            datastores = $dsOut
-        }
-        error  = $null
+        inventory  = $inventory
+        datastores = $dsOut
     } | ConvertTo-Json -Depth 12
+
     exit 0
 }
 catch {

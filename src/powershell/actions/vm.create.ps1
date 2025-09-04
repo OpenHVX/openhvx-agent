@@ -1,53 +1,31 @@
-# powershell/actions/vm.create.ps1
-# Crée une VM Hyper-V à partir d'un payload JSON sur STDIN
-# Example of payload:
-# {
-#   "data": {
-#     "name": "vm-demo",
-#     "generation": 2,
-#     "ram": "4GB",
-#     "path": "D:\\HyperV\\VMs\\vm-demo",        # (optionnel; défaut via __ctx.paths.vms/<tenant>/<name>)
-#     "switch": "vSwitch-LAN",                   # (optionnel)
-#     "cpu": 2,                                  # (optionnel)
-#     "dynamic_memory": true,                    # (optionnel)
-#     "min_ram": "2GB",                          # (optionnel; auto si dyn)
-#     "max_ram": "8GB",                          # (optionnel; auto si dyn)
-#     "vhd_path": "D:\\HyperV\\Disks\\vm.vhdx",  # (optionnel; défaut via __ctx.paths.vhd/<tenant>/<name>.vhdx)
-#     "vhd_size": "60GB"                         # (optionnel; requis si on crée un VHD)
-#     "__ctx": {
-#        "tenantId": "TEN-123",
-#        "paths": { "root":"C:\\Hyper-V\\openhvx", "vms":"...", "vhd":"...", "isos":"...", "checkpoints":"...", "logs":"...", "trash":"..." }
-#     }
-#   }
-# }
-# Sortie: { ok, result: { vm }, error }
+# powershell/actions/vm.create.cloudinit.ps1
+# Crée une VM Hyper-V depuis une image VHDX cloud + seed cloud-init (CIDATA).
+# Entrée: JSON via -InputJson ou STDIN. Supporte l’enveloppe { action, data:{...} }.
+# Attend que le controller ait déjà résolu data.imagePath (UNC/local).
+# Sortie: { ok, result:{ vm }, error?, detail? }
 
-param()
+param(
+    [string]$InputJson
+)
 
 $ErrorActionPreference = 'Stop'
 
 # ---------- Helpers JSON ----------
-function Read-TaskFromStdin {
+function Read-TaskInput {
+    param([string]$Inline)
+    if ($Inline) { try { return ($Inline | ConvertFrom-Json -ErrorAction Stop) } catch {} }
     $raw = [Console]::In.ReadToEnd()
-    if ([string]::IsNullOrWhiteSpace($raw)) {
-        throw "no input"
-    }
-    try { return $raw | ConvertFrom-Json -ErrorAction Stop } catch {
-        throw "invalid JSON"
-    }
+    if ([string]::IsNullOrWhiteSpace($raw)) { throw "No JSON input (use -InputJson or pipe JSON to STDIN)" }
+    try { return ($raw | ConvertFrom-Json -ErrorAction Stop) } catch { throw "Invalid JSON input" }
 }
 
 # ---------- Helpers tailles ----------
 function Resolve-SizeBytes {
-    param([Parameter(Mandatory = $true)][Alias('Value')][object]$InputValue)
-
+    param([Parameter(Mandatory = $true)][object]$InputValue)
     if ($null -eq $InputValue) { return $null }
-
     if ($InputValue -is [int] -or $InputValue -is [long]) {
-        if ($InputValue -le 131072) { return [int64]$InputValue * 1MB }
-        return [int64]$InputValue
+        if ($InputValue -le 131072) { return [int64]$InputValue * 1MB } return [int64]$InputValue
     }
-
     $s = "$InputValue".Trim().ToUpper()
     if ($s -match '^\d+$') {
         $n = [int64]$s
@@ -66,32 +44,28 @@ function Resolve-SizeBytes {
     throw "invalid size: '$InputValue'"
 }
 
-# ---------- Helpers sécurité chemins ----------
+# ---------- Helpers chemins/sécurité ----------
 function Get-FullPath([string]$p) {
     if ([string]::IsNullOrWhiteSpace($p)) { return $null }
     return [System.IO.Path]::GetFullPath($p)
 }
 function Assert-UnderRoot {
     param([string]$Candidate, [string]$Root)
-    if (-not $Root) { return } # sans root de contexte, on ne restreint pas
+    if (-not $Root) { return }
     $c = Get-FullPath $Candidate
     $r = Get-FullPath $Root
     if (-not $c -or -not $r) { throw "invalid path check" }
-    # comparaison insensitive sur Windows
-    if ($c.Length -lt $r.Length -or ($c.Substring(0, $r.Length) -ne $r -and $c.Substring(0, $r.Length).ToLower() -ne $r.ToLower())) {
+    if ($c.Length -lt $r.Length -or ($c.Substring(0, $r.Length)).ToLower() -ne $r.ToLower()) {
         throw "unsafe path outside managed root: $Candidate (root=$Root)"
     }
 }
 function Get-UniquePath {
     param([Parameter(Mandatory = $true)][string]$Path)
-    # si libre, on garde
     if (-not (Test-Path -LiteralPath $Path)) { return $Path }
-
     $dir = [System.IO.Path]::GetDirectoryName($Path)
     $file = [System.IO.Path]::GetFileName($Path)
     $ext = [System.IO.Path]::GetExtension($file)
     $name = if ($ext) { $file.Substring(0, $file.Length - $ext.Length) } else { $file }
-
     for ($i = 1; $i -le 9999; $i++) {
         $cand = if ($ext) { Join-Path $dir "$name ($i)$ext" } else { Join-Path $dir "$name ($i)" }
         if (-not (Test-Path -LiteralPath $cand)) { return $cand }
@@ -100,39 +74,105 @@ function Get-UniquePath {
     return if ($ext) { Join-Path $dir "$name-$stamp$ext" } else { Join-Path $dir "$name-$stamp" }
 }
 function Ensure-Dir([string]$p) {
-    if (-not (Test-Path -LiteralPath $p)) {
-        New-Item -ItemType Directory -Path $p -Force | Out-Null
+    if ($p -and -not (Test-Path -LiteralPath $p)) { New-Item -ItemType Directory -Path $p -Force | Out-Null }
+}
+
+# ---------- Helpers cloud-init ----------
+function New-CloudInitFiles($dir, $Name, $CI) {
+    Ensure-Dir $dir
+
+    # user-data
+    $userdata = @("#cloud-config")
+    if ($CI.hostname) { $userdata += "hostname: $($CI.hostname)" }
+
+    if ($CI.user) {
+        $userdata += "users:"
+        $userdata += "  - name: $($CI.user)"
+        $userdata += "    sudo: ALL=(ALL) NOPASSWD:ALL"
+        $userdata += "    groups: users, admin"
+        $userdata += "    shell: /bin/bash"
+        if ($CI.ssh_authorized_keys) {
+            $userdata += "    ssh_authorized_keys:"
+            $userdata += ($CI.ssh_authorized_keys | ForEach-Object { "      - $_" })
+        }
     }
+    elseif ($CI.ssh_authorized_keys) {
+        $userdata += "ssh_authorized_keys:"
+        $userdata += ($CI.ssh_authorized_keys | ForEach-Object { "  - $_" })
+    }
+
+    if ($CI.packages) { $userdata += "packages:"; $userdata += ($CI.packages | ForEach-Object { "  - $_" }) }
+    if ($CI.runcmd) { $userdata += "runcmd:"; $userdata += ($CI.runcmd   | ForEach-Object { "  - $_" }) }
+
+    $userdataText = ($userdata -join "`n") + "`n"
+    Set-Content -Path (Join-Path $dir "user-data") -Value $userdataText -NoNewline -Encoding UTF8
+
+    # meta-data
+    $instanceId = "$Name-$(Get-Random)"
+    $md = @(
+        "instance-id: $instanceId",
+        "local-hostname: $($CI.hostname ?? $Name)",
+        "dsmode: local"
+    ) -join "`n"
+    Set-Content -Path (Join-Path $dir "meta-data") -Value ($md + "`n") -NoNewline -Encoding UTF8
+
+    # network-config
+    $net = @()
+    if ($CI.network.mode -eq "static") {
+        $net += "version: 2"
+        $net += "ethernets:"
+        $net += "  eth0:"
+        $net += "    dhcp4: false"
+        $net += "    addresses: [ $($CI.network.address) ]"
+        if ($CI.network.gateway) { $net += "    routes: [ { to: default, via: $($CI.network.gateway) } ]" }
+        if ($CI.network.nameservers) { $net += "    nameservers: { addresses: [ $(($CI.network.nameservers -join ', ')) ] }" }
+    }
+    else {
+        $net += "version: 2"
+        $net += "ethernets:"
+        $net += "  eth0:"
+        $net += "    dhcp4: true"
+    }
+    Set-Content -Path (Join-Path $dir "network-config") -Value (($net -join "`n") + "`n") -NoNewline -Encoding UTF8
+}
+
+function New-SeedVhdx($path, $filesDir) {
+    $size = 64MB
+    $vhd = New-VHD -Path $path -SizeBytes $size -Dynamic
+    $disk = (Mount-VHD -Path $path -PassThru | Get-Disk)
+    Initialize-Disk -Number $disk.Number -PartitionStyle MBR -PassThru | Out-Null
+    $part = New-Partition -DiskNumber $disk.Number -UseMaximumSize -AssignDriveLetter -MbrType IFS
+    $vol = Format-Volume -Partition $part -FileSystem FAT32 -NewFileSystemLabel "CIDATA" -Confirm:$false
+    $drive = ($vol.DriveLetter + ":\")
+    Copy-Item -Path (Join-Path $filesDir "*") -Destination $drive -Recurse -Force
+    Dismount-VHD -Path $path
 }
 
 # ---------- MAIN ----------
 try {
-    $task = Read-TaskFromStdin
-    $data = $task.data
-    if (-not $data) { throw "missing 'data' object" }
+    # Lecture + déballage 'data'
+    $task = Read-TaskInput -Inline $InputJson
+    $d = if ($task.PSObject.Properties.Name -contains 'data' -and $task.data) { $task.data } else { $task }
 
-    # Entrées de base
-    if ([string]::IsNullOrWhiteSpace($data.name)) { throw "missing 'data.name'" }
-    $Name = $data.name.Trim()
-    $Generation = if ($data.generation) { [int]$data.generation } else { 2 }
-    if ($Generation -notin 1, 2) { throw "invalid 'data.generation' (must be 1 or 2)" }
+    # Champs requis / optionnels
+    if ([string]::IsNullOrWhiteSpace($d.name)) { throw "missing 'name'" }
+    $Name = $d.name.Trim()
+    $Generation = if ($d.generation) { [int]$d.generation } else { 2 }
+    if ($Generation -notin 1, 2) { throw "invalid 'generation' (must be 1 or 2)" }
 
-    if (-not $data.ram) { throw "missing 'data.ram'" }
-    $MemoryStartupBytes = Resolve-SizeBytes $data.ram
+    if (-not $d.ram) { throw "missing 'ram'" }
+    $MemoryStartupBytes = Resolve-SizeBytes $d.ram
 
-    $SwitchName = $data.switch
-    $CPU = if ($data.cpu) { [int]$data.cpu } else { $null }
+    $CPU = if ($d.cpu) { [int]$d.cpu } else { $null }
+    $SwitchName = $d.switch
+    $DynMem = [bool]$d.dynamic_memory
+    $MinBytes = if ($d.min_ram) { Resolve-SizeBytes $d.min_ram } else { $null }
+    $MaxBytes = if ($d.max_ram) { Resolve-SizeBytes $d.max_ram } else { $null }
+    $CI = $d.cloudInit
 
-    $DynMem = [bool]$data.dynamic_memory
-    $MinBytes = if ($data.min_ram) { Resolve-SizeBytes $data.min_ram } else { $null }
-    $MaxBytes = if ($data.max_ram) { Resolve-SizeBytes $data.max_ram } else { $null }
-
-    # Contexte (facultatif mais recommandé)
-    $ctx = $data.__ctx
-    $tenantId = $null
-    $root = $null
-    $vmsRoot = $null
-    $vhdRoot = $null
+    # Contexte (__ctx) et racines
+    $ctx = $d.__ctx
+    $tenantId = $null; $root = $null; $vmsRoot = $null; $vhdRoot = $null
     if ($ctx) {
         $tenantId = $ctx.tenantId
         if ($ctx.paths) {
@@ -142,84 +182,48 @@ try {
         }
     }
 
-    # Paramètres chemin VM (peuvent être fournis par l'appelant)
-    $Path = $data.path
-    $VhdPath = $data.vhd_path
-    $VhdSize = if ($data.vhd_size) { Resolve-SizeBytes $data.vhd_size } else { $null }
+    # Image système (doit être résolue par le controller)
+    if (-not $d.imagePath) { throw "missing 'imagePath' (controller must enrich imageId -> imagePath)" }
+    $BaseVhdx = $d.imagePath
+    if (-not (Test-Path -LiteralPath $BaseVhdx)) { throw "base image not found: $BaseVhdx" }
 
-    # Si pas de Path, proposer un chemin sûr: <vmsRoot>/<tenantId>/<Name>
-    if (-not $Path) {
-        if ($vmsRoot) {
-            $Path = if ($tenantId) { Join-Path (Join-Path $vmsRoot $tenantId) $Name } else { Join-Path $vmsRoot $Name }
-        }
+    # Emplacements dédiés par type: VMS et VHD, avec tenantId
+    # VM config path
+    $VmDir = $d.path
+    if (-not $VmDir -and $vmsRoot) {
+        $VmDir = if ($tenantId) { Join-Path (Join-Path $vmsRoot $tenantId) $Name } else { Join-Path $vmsRoot $Name }
     }
-    # Si pas de VhdPath mais on doit créer un disque (VhdSize fourni), proposer <vhdRoot>/<tenantId>/<Name>.vhdx
-    if (-not $VhdPath -and $VhdSize) {
-        if ($vhdRoot) {
-            $fileName = "$Name.vhdx"
-            $VhdPath = if ($tenantId) { Join-Path (Join-Path $vhdRoot $tenantId) $fileName } else { Join-Path $vhdRoot $fileName }
-        }
+    if ($VmDir) {
+        Assert-UnderRoot -Candidate $VmDir -Root $root
+        if (Test-Path -LiteralPath $VmDir) { $VmDir = Get-UniquePath -Path $VmDir }
+        Ensure-Dir $VmDir
     }
 
-    # Vérifs sécurité: tout ce qu’on écrit doit rester sous root (si fourni)
-    if ($Path) { Assert-UnderRoot -Candidate $Path    -Root $root }
-    if ($VhdPath) { Assert-UnderRoot -Candidate $VhdPath -Root $root }
+    # VHD storage path (système + seed)
+    if (-not $vhdRoot) { throw "ctx.paths.vhd is required for disk placement" }
+    $VhdDir = if ($tenantId) { Join-Path (Join-Path $vhdRoot $tenantId) $Name } else { Join-Path $vhdRoot $Name }
+    Assert-UnderRoot -Candidate $VhdDir -Root $root
+    Ensure-Dir $VhdDir
 
-    # Garantir absence d’overwrite: dossiers/fichiers uniques
-    if ($Path) {
-        # on ne renomme pas la VM pour éviter collisions de nom; Hyper-V interdit déjà deux VMs de même nom
-        # mais on garantit que le dossier cible n’écrase rien d’existant
-        if (Test-Path -LiteralPath $Path) {
-            $Path = Get-UniquePath -Path $Path
-        }
-        Ensure-Dir $Path
-    }
-    if ($VhdPath) {
-        # Cas 1 : on attache un VHD existant (aucune création) -> pas de rename auto
-        # Cas 2 : on crée un VHD (VhdSize fourni). Si le fichier existe, on choisit un nom unique pour la création.
-        if ($VhdSize -and (Test-Path -LiteralPath $VhdPath)) {
-            $VhdPath = Get-UniquePath -Path $VhdPath
-        }
-        # Prépare le dossier
-        $parent = Split-Path -Path $VhdPath -Parent
-        if ($parent) { Ensure-Dir $parent }
-    }
+    $VmVhdx = Join-Path $VhdDir "disk.vhdx"
+    $SeedVhdx = Join-Path $VhdDir "seed-cidata.vhdx"
 
-    # Existence d'une VM homonyme ?
-    if (Get-VM -Name $Name -ErrorAction SilentlyContinue) {
-        throw "a VM named '$Name' already exists"
-    }
+    # Existence d'une VM homonyme
+    if (Get-VM -Name $Name -ErrorAction SilentlyContinue) { throw "a VM named '$Name' already exists" }
 
-    # Paramètres pour New-VM
+    # 1) Clone du VHDX de base -> disque système
+    Copy-Item -Path $BaseVhdx -Destination $VmVhdx -Force
+
+    # 2) Création de la VM (attache le disque système dès la création)
     $vmParams = @{
         Name               = $Name
         MemoryStartupBytes = $MemoryStartupBytes
         Generation         = $Generation
+        VHDPath            = $VmVhdx
     }
-    if ($Path) { $vmParams.Path = $Path }
+    if ($VmDir) { $vmParams.Path = $VmDir }
     if ($SwitchName) { $vmParams.SwitchName = $SwitchName }
 
-    # Gestion disque:
-    # - Attacher un VHD existant: VhdPath fourni, VhdSize NON fourni -> VHDPath
-    # - Créer un VHD: VhdPath + VhdSize -> NewVHDPath/NewVHDSizeBytes
-    # - Créer un VHD sans chemin explicite -> on a construit $VhdPath ci-dessus
-    $attachExisting = $false
-    if ($VhdPath -and -not $VhdSize) {
-        if (-not (Test-Path -LiteralPath $VhdPath)) {
-            throw "vhd_path does not exist (attach mode): $VhdPath"
-        }
-        $vmParams.VHDPath = $VhdPath
-        $attachExisting = $true
-    }
-    elseif ($VhdPath -and $VhdSize) {
-        $vmParams.NewVHDPath = $VhdPath
-        $vmParams.NewVHDSizeBytes = $VhdSize
-    }
-    elseif ($VhdSize -and -not $VhdPath) {
-        throw "you provided 'vhd_size' without 'vhd_path' and no default could be derived from context"
-    }
-
-    # Création
     $vm = New-VM @vmParams -ErrorAction Stop
 
     # CPU
@@ -233,22 +237,41 @@ try {
         if (-not $MaxBytes) { $MaxBytes = [int64]([math]::Max($MemoryStartupBytes, 2GB)) }
         if ($MinBytes -gt $MemoryStartupBytes) { $tmp = $MinBytes; $MinBytes = $MemoryStartupBytes; $MemoryStartupBytes = $tmp }
         if ($MaxBytes -lt $MemoryStartupBytes) { $MaxBytes = $MemoryStartupBytes }
-
-        Set-VMMemory -VM $vm `
-            -DynamicMemoryEnabled $true `
-            -MinimumBytes $MinBytes `
-            -MaximumBytes $MaxBytes `
-            -StartupBytes $MemoryStartupBytes -ErrorAction Stop | Out-Null
+        Set-VMMemory -VM $vm -DynamicMemoryEnabled $true -MinimumBytes $MinBytes -MaximumBytes $MaxBytes -StartupBytes $MemoryStartupBytes -ErrorAction Stop | Out-Null
     }
     else {
         Set-VMMemory -VM $vm -DynamicMemoryEnabled $false -StartupBytes $MemoryStartupBytes -ErrorAction Stop | Out-Null
     }
 
-    # Objet VM normalisé
+    # 3) Générer les fichiers cloud-init et créer le VHDX CIDATA
+    $tmp = Join-Path $env:TEMP ("cidata-" + [guid]::NewGuid().ToString())
+    Ensure-Dir $tmp
+    New-CloudInitFiles -dir $tmp -Name $Name -CI $CI
+    New-SeedVhdx -path $SeedVhdx -filesDir $tmp
+    Remove-Item -Path $tmp -Recurse -Force
+
+    # 4) Attacher le seed comme second disque (SCSI)
+    Add-VMHardDiskDrive -VMName $Name -Path $SeedVhdx
+
+    # 5) Ordre de boot (disque système en premier), utile surtout pour Gen2
+    if ($Generation -eq 2) {
+        $sys = Get-VMHardDiskDrive -VMName $Name | Where-Object { $_.Path -eq $VmVhdx }
+        if ($sys) { Set-VMFirmware -VMName $Name -FirstBootDevice $sys | Out-Null }
+    }
+
+    # (Optionnel) SecureBoot Linux Gen2
+    # if ($Generation -eq 2) {
+    #   Set-VMFirmware -VMName $Name -EnableSecureBoot On -SecureBootTemplate "MicrosoftUEFICertificateAuthority" | Out-Null
+    # }
+
+    # 6) Boot
+    Start-VM -Name $Name | Out-Null
+
+    # Sortie normalisée
     $vmObj = @{
         name       = $vm.Name
-        id         = "$($vm.Id)"         # compat
-        guid       = "$($vm.Id)"         # clé stable pour TenantResource
+        id         = "$($vm.Id)"
+        guid       = "$($vm.Id)"
         generation = $Generation
         path       = $vm.Path
         cpu        = $CPU
@@ -259,13 +282,15 @@ try {
             max     = $MaxBytes
         }
         network    = $SwitchName
-        disk       = @{
-            vhd_path         = if ($attachExisting) { $VhdPath } elseif ($vm.HardDrives[0]) { $vm.HardDrives[0].Path } else { $VhdPath }
-            vhd_size         = $VhdSize
-            exists           = ($(if ($VhdPath) { Test-Path -LiteralPath $VhdPath } else { $false }))
-            attachedExisting = $attachExisting
-        }
+        disks      = @(
+            @{ role = "system"; path = $VmVhdx },
+            @{ role = "cidata"; path = $SeedVhdx }
+        )
         tenantId   = $tenantId
+        locations  = @{
+            vm  = $VmDir
+            vhd = $VhdDir
+        }
     }
 
     [pscustomobject]@{
@@ -276,7 +301,6 @@ try {
 catch {
     $errMsg = $_.Exception.Message
     $errFull = ($_ | Out-String).Trim()
-
     [pscustomobject]@{
         ok     = $false
         result = $null

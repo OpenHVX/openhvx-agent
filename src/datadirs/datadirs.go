@@ -15,6 +15,7 @@ type DataDirs struct {
 	Root        string
 	VMS         string
 	VHD         string
+	Images      string // GLOBAL, lecture seule (catalogue d’images cloud)
 	ISOs        string
 	Checkpoints string
 	Logs        string
@@ -35,13 +36,14 @@ func EnsureDataDirs(basePath string) (DataDirs, error) {
 		Root:        root,
 		VMS:         filepath.Join(root, "VMS"),
 		VHD:         filepath.Join(root, "VHD"),
+		Images:      filepath.Join(root, "Images"),
 		ISOs:        filepath.Join(root, "ISOs"),
 		Checkpoints: filepath.Join(root, "Checkpoints"),
 		Logs:        filepath.Join(root, "Logs"),
 		Trash:       filepath.Join(root, "_trash"),
 	}
 
-	for _, p := range []string{d.Root, d.VMS, d.VHD, d.ISOs, d.Checkpoints, d.Logs, d.Trash} {
+	for _, p := range []string{d.Root, d.VMS, d.VHD, d.Images, d.ISOs, d.Checkpoints, d.Logs, d.Trash} {
 		if err := os.MkdirAll(p, 0o755); err != nil {
 			return DataDirs{}, fmt.Errorf("mkdir %s: %w", p, err)
 		}
@@ -56,7 +58,7 @@ func writeGuards(d DataDirs) error {
 			"Any destructive operation must move targets into '_trash'.\n",
 	)
 	var firstErr error
-	for _, dir := range []string{d.Root, d.VMS, d.VHD, d.ISOs, d.Checkpoints, d.Logs, d.Trash} {
+	for _, dir := range []string{d.Root, d.VMS, d.VHD, d.Images, d.ISOs, d.Checkpoints, d.Logs, d.Trash} {
 		fp := filepath.Join(dir, "DO-NOT-DELETE.txt")
 		if _, err := os.Stat(fp); err == nil {
 			continue
@@ -95,7 +97,6 @@ func isUnder(p, base string) bool {
 	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return false
 	}
-	// Evite les chemins absolus "relatifs"
 	if filepath.IsAbs(rel) {
 		return false
 	}
@@ -109,6 +110,7 @@ func IsProtectedPath(p string, d DataDirs) bool {
 		filepath.Clean(d.Root):        {},
 		filepath.Clean(d.VMS):         {},
 		filepath.Clean(d.VHD):         {},
+		filepath.Clean(d.Images):      {},
 		filepath.Clean(d.ISOs):        {},
 		filepath.Clean(d.Checkpoints): {},
 		filepath.Clean(d.Logs):        {},
@@ -135,9 +137,6 @@ func AssertSafeTarget(target string, d DataDirs) error {
 
 // ---------- Corbeille interne (aucune suppression) ----------
 
-// MoveToTrash déplace un fichier/dossier ciblé dans la corbeille interne (_trash).
-// Si la cible est un dossier protégé ou hors Root, renvoie une erreur.
-// Si déplacement impossible (ex: cross-device), renvoie une erreur (aucune suppression).
 func MoveToTrash(target string, d DataDirs) (string, error) {
 	if err := AssertSafeTarget(target, d); err != nil {
 		return "", err
@@ -153,7 +152,6 @@ func MoveToTrash(target string, d DataDirs) (string, error) {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return "", fmt.Errorf("prepare trash dir: %w", err)
 	}
-	// Ne jamais écraser en trash : si collision, crée un nom unique
 	uniqueDst, err := uniquePath(dst)
 	if err != nil {
 		return "", err
@@ -166,9 +164,6 @@ func MoveToTrash(target string, d DataDirs) (string, error) {
 
 // ---------- Noms uniques & opérations sans overwrite ----------
 
-// uniquePath renvoie un chemin qui N’EXISTE PAS, basé sur p.
-// p   => p (si libre)
-// p.ext => p (si libre), sinon p (1).ext, p (2).ext, ... ; fallback suffixe timestamp si trop de collisions.
 func uniquePath(p string) (string, error) {
 	dir := filepath.Dir(p)
 	base := filepath.Base(p)
@@ -180,7 +175,6 @@ func uniquePath(p string) (string, error) {
 			if os.IsNotExist(err) {
 				return candidate, true
 			}
-			// autre erreur d’accès -> on considère non libre
 		}
 		return "", false
 	}
@@ -189,7 +183,6 @@ func uniquePath(p string) (string, error) {
 		return cand, nil
 	}
 
-	// Boucle suffixée
 	for i := 1; i <= 9999; i++ {
 		c := filepath.Join(dir, fmt.Sprintf("%s (%d)%s", name, i, ext))
 		if cand, ok := try(c); ok {
@@ -197,7 +190,6 @@ func uniquePath(p string) (string, error) {
 		}
 	}
 
-	// Fallback timestamp (très improbable d’y arriver)
 	ts := time.Now().UTC().Format("20060102-150405.000")
 	c := filepath.Join(dir, fmt.Sprintf("%s-%s%s", name, ts, ext))
 	if cand, ok := try(c); ok {
@@ -206,14 +198,11 @@ func uniquePath(p string) (string, error) {
 	return "", fmt.Errorf("unable to find a free name for %s", p)
 }
 
-// SafeMkdirAll crée un dossier sous Root, mais refuse d’écraser/renommer un dossier protégé.
-// Utile pour créer des sous-dossiers VM (ex: VMS/<tenant>/<vm>).
 func SafeMkdirAll(dir string, mode os.FileMode, d DataDirs) error {
 	canon, err := canonicalize(dir)
 	if err != nil {
 		return err
 	}
-	// Autorisé uniquement SOUS Root et pas un protégé en tant que cible directe.
 	if !isUnder(canon, d.Root) {
 		return fmt.Errorf("mkdir outside managed root: %s", canon)
 	}
@@ -223,9 +212,6 @@ func SafeMkdirAll(dir string, mode os.FileMode, d DataDirs) error {
 	return os.MkdirAll(canon, mode)
 }
 
-// SafeCreateFile crée un fichier en mode EXCLUSIF (pas d’overwrite).
-// S’il existe, génère un nom unique (ex: "file (1).vhdx").
-// Retourne le *os.File ouvert en écriture et le chemin final choisi.
 func SafeCreateFile(dest string, perm os.FileMode, d DataDirs) (*os.File, string, error) {
 	if err := AssertSafeTarget(dest, d); err != nil {
 		return nil, "", err
@@ -237,12 +223,10 @@ func SafeCreateFile(dest string, perm os.FileMode, d DataDirs) (*os.File, string
 	if err := os.MkdirAll(filepath.Dir(destCanon), 0o755); err != nil {
 		return nil, "", fmt.Errorf("prepare parent dir: %w", err)
 	}
-	// Assure un nom libre
 	finalPath, err := uniquePath(destCanon)
 	if err != nil {
 		return nil, "", err
 	}
-	// O_EXCL pour éviter toute race d’overwrite
 	f, err := os.OpenFile(finalPath, os.O_RDWR|os.O_CREATE|os.O_EXCL, perm)
 	if err != nil {
 		return nil, "", err
@@ -250,9 +234,6 @@ func SafeCreateFile(dest string, perm os.FileMode, d DataDirs) (*os.File, string
 	return f, finalPath, nil
 }
 
-// SafeWriteFileAtomicUnique écrit data de façon atomique, sans jamais écraser un fichier existant.
-// Stratégie: écrire dans un fichier temporaire dans le même dossier puis rename vers un nom UNIQUE.
-// Retourne le chemin final effectivement utilisé (peut différer si collision).
 func SafeWriteFileAtomicUnique(dest string, data []byte, perm os.FileMode, d DataDirs) (string, error) {
 	if err := AssertSafeTarget(dest, d); err != nil {
 		return "", err
@@ -266,19 +247,16 @@ func SafeWriteFileAtomicUnique(dest string, data []byte, perm os.FileMode, d Dat
 		return "", fmt.Errorf("prepare parent dir: %w", err)
 	}
 
-	// Fichier temporaire
 	tmp, err := os.CreateTemp(parent, ".openhvx-*")
 	if err != nil {
 		return "", fmt.Errorf("create temp: %w", err)
 	}
 	tmpPath := tmp.Name()
 	defer func() {
-		// Nettoyage du temp en cas d’erreur
 		_ = tmp.Close()
 		_ = os.Remove(tmpPath)
 	}()
 
-	// Écrire + flush
 	if _, err := tmp.Write(data); err != nil {
 		return "", fmt.Errorf("write temp: %w", err)
 	}
@@ -289,23 +267,17 @@ func SafeWriteFileAtomicUnique(dest string, data []byte, perm os.FileMode, d Dat
 		return "", fmt.Errorf("close temp: %w", err)
 	}
 
-	// Choisir un destinataire UNIQUE (pas d’overwrite)
 	finalPath, err := uniquePath(destCanon)
 	if err != nil {
 		return "", err
 	}
-
-	// Rename atomique (même volume)
 	if err := os.Rename(tmpPath, finalPath); err != nil {
 		return "", fmt.Errorf("atomic rename failed: %w", err)
 	}
-	// Appliquer permissions (best-effort)
 	_ = os.Chmod(finalPath, perm)
 	return finalPath, nil
 }
 
-// SafeRenameNoOverwrite renomme/move src -> dst sans jamais écraser une cible existante.
-// Si dst existe, génère un nom unique. Refuse d’opérer sur dossiers protégés.
 func SafeRenameNoOverwrite(src, dst string, d DataDirs) (string, error) {
 	if err := AssertSafeTarget(src, d); err != nil {
 		return "", fmt.Errorf("invalid src: %w", err)
@@ -334,8 +306,6 @@ func SafeRenameNoOverwrite(src, dst string, d DataDirs) (string, error) {
 	return finalDst, nil
 }
 
-// SafeCopyFileNoOverwrite copie src -> dst sans overwrite (utilise un nom unique si collision).
-// ⚠️ À utiliser uniquement si Rename n’est pas possible (ex: cross-device).
 func SafeCopyFileNoOverwrite(src, dst string, perm os.FileMode, d DataDirs) (string, error) {
 	if err := AssertSafeTarget(src, d); err != nil {
 		return "", fmt.Errorf("invalid src: %w", err)
@@ -384,7 +354,6 @@ func SafeCopyFileNoOverwrite(src, dst string, perm os.FileMode, d DataDirs) (str
 
 // ---------- Petits utilitaires ----------
 
-// JoinVMDir propose un sous-dossier VM sous VMS (ex: VMS/<tenant>/<vm>), en s’assurant que ça reste sous Root.
 func JoinVMDir(d DataDirs, elems ...string) (string, error) {
 	path := filepath.Join(append([]string{d.VMS}, elems...)...)
 	canon, err := canonicalize(path)
@@ -397,7 +366,48 @@ func JoinVMDir(d DataDirs, elems ...string) (string, error) {
 	return canon, nil
 }
 
-// SuffixWithTenantId ajoute un suffixe "-<tenantId>" avant l’extension si présent.
+// JoinTenantVMDir construit VMS/<tenantId>/<...>
+func JoinTenantVMDir(d DataDirs, tenantId string, elems ...string) (string, error) {
+	if tenantId == "" {
+		return "", fmt.Errorf("empty tenantId")
+	}
+	parts := append([]string{d.VMS, tenantId}, elems...)
+	p := filepath.Join(parts...)
+	canon, err := canonicalize(p)
+	if err != nil {
+		return "", err
+	}
+	if !isUnder(canon, d.VMS) {
+		return "", fmt.Errorf("vm dir escapes VMS: %s", canon)
+	}
+	return canon, nil
+}
+
+// JoinImagesPath construit un chemin SOUS le dépôt global d'images.
+func JoinImagesPath(d DataDirs, elems ...string) (string, error) {
+	p := filepath.Join(append([]string{d.Images}, elems...)...)
+	canon, err := canonicalize(p)
+	if err != nil {
+		return "", err
+	}
+	if !isUnder(canon, d.Images) {
+		return "", fmt.Errorf("image path escapes Images: %s", canon)
+	}
+	return canon, nil
+}
+
+// AssertReadableImage s'assure qu'un chemin d'image est bien sous d.Images.
+func AssertReadableImage(imgPath string, d DataDirs) error {
+	c, err := canonicalize(imgPath)
+	if err != nil {
+		return err
+	}
+	if !isUnder(c, d.Images) {
+		return fmt.Errorf("image not under Images: %s", c)
+	}
+	return nil
+}
+
 func SuffixWithTenantId(p string, tenantId string) string {
 	if tenantId == "" {
 		return p
@@ -409,7 +419,6 @@ func SuffixWithTenantId(p string, tenantId string) string {
 	return filepath.Join(dir, name+"-"+tenantId+ext)
 }
 
-// NextSequenceName génère "name (n).ext" à partir d’un path existant (utile pour afficher le nom retenu).
 func NextSequenceName(p string) string {
 	dir := filepath.Dir(p)
 	base := filepath.Base(p)
@@ -425,18 +434,17 @@ func NextSequenceName(p string) string {
 	return filepath.Join(dir, name+"-"+ts+ext)
 }
 
-// DebugString des chemins gérés (utile pour logs)
 func (d DataDirs) DebugString() string {
 	return "Root=" + d.Root +
 		" VMS=" + d.VMS +
 		" VHD=" + d.VHD +
+		" Images=" + d.Images +
 		" ISOs=" + d.ISOs +
 		" Checkpoints=" + d.Checkpoints +
 		" Logs=" + d.Logs +
 		" Trash=" + d.Trash
 }
 
-// Optional helper: parse "size in MB" string to int (defensive)
 func atoiDef(s string, def int) int {
 	i, err := strconv.Atoi(s)
 	if err != nil {
