@@ -1,14 +1,22 @@
-# powershell/actions/vm.create.cloudinit.ps1
+# powershell/actions/vm.create.ps1
 # Crée une VM Hyper-V depuis une image VHDX cloud + seed cloud-init (CIDATA).
 # Entrée: JSON via -InputJson ou STDIN. Supporte l’enveloppe { action, data:{...} }.
 # Attend que le controller ait déjà résolu data.imagePath (UNC/local).
-# Sortie: { ok, result:{ vm }, error?, detail? }
+# Sortie:
+#   Succès -> { ok:true, result:{ vm:{...} }, notes?:[...] }
+#   Échec  -> { ok:false, result:null, error:"...", detail:"stack..." }
 
 param(
     [string]$InputJson
 )
 
+# --- IMPORTANT: no useless STDOUT ---
 $ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+$WarningPreference = 'SilentlyContinue'
+$VerbosePreference = 'SilentlyContinue'
+
+$notes = New-Object System.Collections.Generic.List[string]
 
 # ---------- Helpers JSON ----------
 function Read-TaskInput {
@@ -19,7 +27,7 @@ function Read-TaskInput {
     try { return ($raw | ConvertFrom-Json -ErrorAction Stop) } catch { throw "Invalid JSON input" }
 }
 
-# ---------- Helpers tailles ----------
+# ---------- Helpers size ----------
 function Resolve-SizeBytes {
     param([Parameter(Mandatory = $true)][object]$InputValue)
     if ($null -eq $InputValue) { return $null }
@@ -44,7 +52,7 @@ function Resolve-SizeBytes {
     throw "invalid size: '$InputValue'"
 }
 
-# ---------- Helpers chemins/sécurité ----------
+# ---------- Helpers path ----------
 function Get-FullPath([string]$p) {
     if ([string]::IsNullOrWhiteSpace($p)) { return $null }
     return [System.IO.Path]::GetFullPath($p)
@@ -77,20 +85,21 @@ function Ensure-Dir([string]$p) {
     if ($p -and -not (Test-Path -LiteralPath $p)) { New-Item -ItemType Directory -Path $p -Force | Out-Null }
 }
 
-# ---------- Helpers cloud-init ----------
+# ---------- Helpers cloud-init (files) ----------
 function New-CloudInitFiles($dir, $Name, $CI) {
     Ensure-Dir $dir
 
     # user-data
     $userdata = @("#cloud-config")
     if ($CI.hostname) { $userdata += "hostname: $($CI.hostname)" }
-
+    $userdata += "datasource_list: [ NoCloud ]"
     if ($CI.user) {
         $userdata += "users:"
         $userdata += "  - name: $($CI.user)"
         $userdata += "    sudo: ALL=(ALL) NOPASSWD:ALL"
         $userdata += "    groups: users, admin"
         $userdata += "    shell: /bin/bash"
+    
         if ($CI.ssh_authorized_keys) {
             $userdata += "    ssh_authorized_keys:"
             $userdata += ($CI.ssh_authorized_keys | ForEach-Object { "      - $_" })
@@ -136,25 +145,21 @@ function New-CloudInitFiles($dir, $Name, $CI) {
     Set-Content -Path (Join-Path $dir "network-config") -Value (($net -join "`n") + "`n") -NoNewline -Encoding UTF8
 }
 
-function New-SeedVhdx($path, $filesDir) {
-    $size = 64MB
-    $vhd = New-VHD -Path $path -SizeBytes $size -Dynamic
-    $disk = (Mount-VHD -Path $path -PassThru | Get-Disk)
-    Initialize-Disk -Number $disk.Number -PartitionStyle MBR -PassThru | Out-Null
-    $part = New-Partition -DiskNumber $disk.Number -UseMaximumSize -AssignDriveLetter -MbrType IFS
-    $vol = Format-Volume -Partition $part -FileSystem FAT32 -NewFileSystemLabel "CIDATA" -Confirm:$false
-    $drive = ($vol.DriveLetter + ":\")
-    Copy-Item -Path (Join-Path $filesDir "*") -Destination $drive -Recurse -Force
-    Dismount-VHD -Path $path
+# ---------- Helpers seed builder (openhvx-cidata-iso) ----------
+function New-SeedIso($filesDir, $isoPath) {
+    $exe = Join-Path (Join-Path (Split-Path $PSScriptRoot -Parent) "bin") "openhvx-cidata-iso.exe"
+    if (-not (Test-Path $exe)) { throw "openhvx-cidata-iso.exe not found at $exe" }
+
+    $args = @("-in", $filesDir, "-out", $isoPath, "-label", "cidata")
+    $p = Start-Process -FilePath $exe -ArgumentList $args -NoNewWindow -PassThru -Wait
+    if ($p.ExitCode -ne 0) { throw "openhvx-cidata-iso.exe failed with code $($p.ExitCode)" }
 }
 
 # ---------- MAIN ----------
 try {
-    # Lecture + déballage 'data'
     $task = Read-TaskInput -Inline $InputJson
     $d = if ($task.PSObject.Properties.Name -contains 'data' -and $task.data) { $task.data } else { $task }
 
-    # Champs requis / optionnels
     if ([string]::IsNullOrWhiteSpace($d.name)) { throw "missing 'name'" }
     $Name = $d.name.Trim()
     $Generation = if ($d.generation) { [int]$d.generation } else { 2 }
@@ -170,7 +175,10 @@ try {
     $MaxBytes = if ($d.max_ram) { Resolve-SizeBytes $d.max_ram } else { $null }
     $CI = $d.cloudInit
 
-    # Contexte (__ctx) et racines
+    $SecureBoot = $false
+    if ($null -ne $d.secure_boot) { $SecureBoot = [bool]$d.secure_boot }
+    $CiDataFormat = "iso"
+
     $ctx = $d.__ctx
     $tenantId = $null; $root = $null; $vmsRoot = $null; $vhdRoot = $null
     if ($ctx) {
@@ -182,13 +190,10 @@ try {
         }
     }
 
-    # Image système (doit être résolue par le controller)
-    if (-not $d.imagePath) { throw "missing 'imagePath' (controller must enrich imageId -> imagePath)" }
+    if (-not $d.imagePath) { throw "missing 'imagePath'" }
     $BaseVhdx = $d.imagePath
     if (-not (Test-Path -LiteralPath $BaseVhdx)) { throw "base image not found: $BaseVhdx" }
 
-    # Emplacements dédiés par type: VMS et VHD, avec tenantId
-    # VM config path
     $VmDir = $d.path
     if (-not $VmDir -and $vmsRoot) {
         $VmDir = if ($tenantId) { Join-Path (Join-Path $vmsRoot $tenantId) $Name } else { Join-Path $vmsRoot $Name }
@@ -199,22 +204,18 @@ try {
         Ensure-Dir $VmDir
     }
 
-    # VHD storage path (système + seed)
     if (-not $vhdRoot) { throw "ctx.paths.vhd is required for disk placement" }
     $VhdDir = if ($tenantId) { Join-Path (Join-Path $vhdRoot $tenantId) $Name } else { Join-Path $vhdRoot $Name }
     Assert-UnderRoot -Candidate $VhdDir -Root $root
     Ensure-Dir $VhdDir
 
     $VmVhdx = Join-Path $VhdDir "disk.vhdx"
-    $SeedVhdx = Join-Path $VhdDir "seed-cidata.vhdx"
+    $SeedIso = Join-Path $VhdDir "seed-cidata.iso"
 
-    # Existence d'une VM homonyme
     if (Get-VM -Name $Name -ErrorAction SilentlyContinue) { throw "a VM named '$Name' already exists" }
 
-    # 1) Clone du VHDX de base -> disque système
     Copy-Item -Path $BaseVhdx -Destination $VmVhdx -Force
 
-    # 2) Création de la VM (attache le disque système dès la création)
     $vmParams = @{
         Name               = $Name
         MemoryStartupBytes = $MemoryStartupBytes
@@ -226,12 +227,10 @@ try {
 
     $vm = New-VM @vmParams -ErrorAction Stop
 
-    # CPU
     if ($CPU -and $CPU -ge 1) {
         Set-VM -VM $vm -ProcessorCount $CPU -ErrorAction Stop | Out-Null
     }
 
-    # Mémoire
     if ($DynMem) {
         if (-not $MinBytes) { $MinBytes = [int64]([math]::Max(512MB, [math]::Floor($MemoryStartupBytes * 0.5))) }
         if (-not $MaxBytes) { $MaxBytes = [int64]([math]::Max($MemoryStartupBytes, 2GB)) }
@@ -243,31 +242,33 @@ try {
         Set-VMMemory -VM $vm -DynamicMemoryEnabled $false -StartupBytes $MemoryStartupBytes -ErrorAction Stop | Out-Null
     }
 
-    # 3) Générer les fichiers cloud-init et créer le VHDX CIDATA
+    if ($Generation -eq 2) {
+        if ($SecureBoot) {
+            Set-VMFirmware -VMName $Name -EnableSecureBoot On -SecureBootTemplate "MicrosoftUEFICertificateAuthority" | Out-Null
+        }
+        else {
+            Set-VMFirmware -VMName $Name -EnableSecureBoot Off | Out-Null
+        }
+    }
+
     $tmp = Join-Path $env:TEMP ("cidata-" + [guid]::NewGuid().ToString())
     Ensure-Dir $tmp
     New-CloudInitFiles -dir $tmp -Name $Name -CI $CI
-    New-SeedVhdx -path $SeedVhdx -filesDir $tmp
+
+    New-SeedIso -filesDir $tmp -isoPath $SeedIso
+    Add-VMDvdDrive -VMName $Name -Path $SeedIso | Out-Null
     Remove-Item -Path $tmp -Recurse -Force
 
-    # 4) Attacher le seed comme second disque (SCSI)
-    Add-VMHardDiskDrive -VMName $Name -Path $SeedVhdx
-
-    # 5) Ordre de boot (disque système en premier), utile surtout pour Gen2
     if ($Generation -eq 2) {
         $sys = Get-VMHardDiskDrive -VMName $Name | Where-Object { $_.Path -eq $VmVhdx }
         if ($sys) { Set-VMFirmware -VMName $Name -FirstBootDevice $sys | Out-Null }
     }
 
-    # (Optionnel) SecureBoot Linux Gen2
-    # if ($Generation -eq 2) {
-    #   Set-VMFirmware -VMName $Name -EnableSecureBoot On -SecureBootTemplate "MicrosoftUEFICertificateAuthority" | Out-Null
-    # }
-
-    # 6) Boot
     Start-VM -Name $Name | Out-Null
 
-    # Sortie normalisée
+    $disks = @(@{ role = "system"; path = $VmVhdx })
+    if (Test-Path $SeedIso) { $disks += @{ role = "cidata"; path = $SeedIso; type = "iso" } }
+
     $vmObj = @{
         name       = $vm.Name
         id         = "$($vm.Id)"
@@ -282,30 +283,28 @@ try {
             max     = $MaxBytes
         }
         network    = $SwitchName
-        disks      = @(
-            @{ role = "system"; path = $VmVhdx },
-            @{ role = "cidata"; path = $SeedVhdx }
-        )
+        disks      = $disks
         tenantId   = $tenantId
         locations  = @{
             vm  = $VmDir
             vhd = $VhdDir
         }
+        firmware   = @{
+            secureBoot = if ($Generation -eq 2) { $SecureBoot } else { $null }
+        }
+        cidata     = @{
+            format = "iso"
+        }
     }
 
-    [pscustomobject]@{
-        vm = $vmObj
-    } | ConvertTo-Json -Depth 8
+    $payload = @{ vm = $vmObj }
+    if ($notes.Count -gt 0) { $payload.notes = $notes }
+
+    $payload | ConvertTo-Json -Depth 10
     exit 0
 }
 catch {
     $errMsg = $_.Exception.Message
-    $errFull = ($_ | Out-String).Trim()
-    [pscustomobject]@{
-        ok     = $false
-        result = $null
-        error  = $errMsg
-        detail = $errFull
-    } | ConvertTo-Json -Depth 6
+    Write-Error $errMsg
     exit 1
 }
