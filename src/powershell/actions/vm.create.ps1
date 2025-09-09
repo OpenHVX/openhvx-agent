@@ -1,7 +1,7 @@
 # powershell/actions/vm.create.ps1
 # Crée une VM Hyper-V depuis une image VHDX cloud + seed cloud-init (CIDATA).
+# Ajoute la configuration COM1 (Named Pipe) et prépare cloud-init pour la console série.
 # Entrée: JSON via -InputJson ou STDIN. Supporte l’enveloppe { action, data:{...} }.
-# Attend que le controller ait déjà résolu data.imagePath (UNC/local).
 # Sortie:
 #   Succès -> { ok:true, result:{ vm:{...} }, notes?:[...] }
 #   Échec  -> { ok:false, result:null, error:"...", detail:"stack..." }
@@ -89,50 +89,88 @@ function Ensure-Dir([string]$p) {
 function New-CloudInitFiles($dir, $Name, $CI) {
     Ensure-Dir $dir
 
-    # user-data
     $userdata = @("#cloud-config")
-    if ($CI.hostname) { $userdata += "hostname: $($CI.hostname)" }
+    $hostname = $Name
+    if ($CI -and $CI.PSObject.Properties.Name -contains 'hostname' -and $CI.hostname) {
+        $hostname = $CI.hostname
+    }
+    $userdata += "hostname: $hostname"
     $userdata += "datasource_list: [ NoCloud ]"
-    if ($CI.user) {
+
+    # users / ssh keys
+    if ($CI -and $CI.user) {
         $userdata += "users:"
         $userdata += "  - name: $($CI.user)"
         $userdata += "    sudo: ALL=(ALL) NOPASSWD:ALL"
         $userdata += "    groups: users, admin"
         $userdata += "    shell: /bin/bash"
-    
         if ($CI.ssh_authorized_keys) {
             $userdata += "    ssh_authorized_keys:"
             $userdata += ($CI.ssh_authorized_keys | ForEach-Object { "      - $_" })
         }
     }
-    elseif ($CI.ssh_authorized_keys) {
+    elseif ($CI -and $CI.ssh_authorized_keys) {
         $userdata += "ssh_authorized_keys:"
         $userdata += ($CI.ssh_authorized_keys | ForEach-Object { "  - $_" })
     }
 
-    if ($CI.packages) { $userdata += "packages:"; $userdata += ($CI.packages | ForEach-Object { "  - $_" }) }
-    if ($CI.runcmd) { $userdata += "runcmd:"; $userdata += ($CI.runcmd   | ForEach-Object { "  - $_" }) }
+    if ($CI -and $CI.packages) {
+        $userdata += "packages:"
+        $userdata += ($CI.packages | ForEach-Object { "  - $_" })
+    }
 
-    $userdataText = ($userdata -join "`n") + "`n"
-    Set-Content -Path (Join-Path $dir "user-data") -Value $userdataText -NoNewline -Encoding UTF8
+    # runcmd (utilisateur)
+    $addedRuncmdHeader = $false
+    if ($CI -and $CI.runcmd) {
+        $userdata += "runcmd:"
+        $addedRuncmdHeader = $true
+        $userdata += ($CI.runcmd | ForEach-Object { "  - $_" })
+    }
 
-    # meta-data
-    $instanceId = "$Name-$(Get-Random)"
-    $md = @(
-        "instance-id: $instanceId",
-        "local-hostname: $($CI.hostname ?? $Name)",
-        "dsmode: local"
-    ) -join "`n"
-    Set-Content -Path (Join-Path $dir "meta-data") -Value ($md + "`n") -NoNewline -Encoding UTF8
+    # ----- Activer console série Linux (option par défaut) -----
+    $enableSerial = $true
+    if ($CI -and $CI.PSObject.Properties.Name -contains 'enableSerial') {
+        $enableSerial = [bool]$CI.enableSerial
+    }
+    if ($enableSerial) {
+        if (-not $addedRuncmdHeader) {
+            $userdata += "runcmd:"
+            $addedRuncmdHeader = $true
+        }
+
+        # Ajoute console=ttyS0 aux kernels (RHEL via grubby, Debian/Ubuntu via /etc/default/grub)
+        $cmd1 = (@'
+sh -c 'if command -v grubby >/dev/null 2>&1; then grubby --update-kernel=ALL --args="console=ttyS0,115200n8 console=tty0"; elif [ -f /etc/default/grub ]; then if ! grep -q "console=ttyS0" /etc/default/grub; then sed -i "s/GRUB_CMDLINE_LINUX=\"\([^\"]*\)\"/GRUB_CMDLINE_LINUX=\"\1 console=ttyS0,115200n8 console=tty0\"/" /etc/default/grub; fi; if command -v update-grub >/dev/null 2>&1; then update-grub; elif command -v grub2-mkconfig >/dev/null 2>&1; then grub2-mkconfig -o /boot/grub2/grub.cfg; fi; fi || true'
+'@).Trim()
+
+        $cmd2 = "systemctl enable --now serial-getty@ttyS0.service || true"
+
+        $userdata += "  - $cmd1"
+        $userdata += "  - $cmd2"
+
+        # reboot auto optionnel (cloud-init power_state)
+        $serialReboot = $false
+        if ($CI -and $CI.PSObject.Properties.Name -contains 'serialReboot') {
+            $serialReboot = [bool]$CI.serialReboot
+        }
+        if ($serialReboot) {
+            $userdata += "power_state:"
+            $userdata += "  mode: reboot"
+            $userdata += "  timeout: 30"
+            $userdata += "  message: Applying serial console settings"
+            $userdata += "  condition: true"
+        }
+    }
+
 
     # network-config
     $net = @()
-    if ($CI.network.mode -eq "static") {
+    if ($CI -and $CI.network -and $CI.network.mode -eq "static") {
         $net += "version: 2"
         $net += "ethernets:"
         $net += "  eth0:"
         $net += "    dhcp4: false"
-        $net += "    addresses: [ $($CI.network.address) ]"
+        if ($CI.network.address) { $net += "    addresses: [ $($CI.network.address) ]" }
         if ($CI.network.gateway) { $net += "    routes: [ { to: default, via: $($CI.network.gateway) } ]" }
         if ($CI.network.nameservers) { $net += "    nameservers: { addresses: [ $(($CI.network.nameservers -join ', ')) ] }" }
     }
@@ -142,6 +180,19 @@ function New-CloudInitFiles($dir, $Name, $CI) {
         $net += "  eth0:"
         $net += "    dhcp4: true"
     }
+
+    $userdataText = ($userdata -join "`n") + "`n"
+    Set-Content -Path (Join-Path $dir "user-data") -Value $userdataText -NoNewline -Encoding UTF8
+
+    $hostForMd = if ($CI -and $CI.hostname) { $CI.hostname } else { $Name }
+    $instanceId = "$Name-$(Get-Random)"
+    $md = @(
+        "instance-id: $instanceId",
+        "local-hostname: $hostForMd",
+        "dsmode: local"
+    ) -join "`n"
+    Set-Content -Path (Join-Path $dir "meta-data") -Value ($md + "`n") -NoNewline -Encoding UTF8
+
     Set-Content -Path (Join-Path $dir "network-config") -Value (($net -join "`n") + "`n") -NoNewline -Encoding UTF8
 }
 
@@ -242,6 +293,13 @@ try {
         Set-VMMemory -VM $vm -DynamicMemoryEnabled $false -StartupBytes $MemoryStartupBytes -ErrorAction Stop | Out-Null
     }
 
+    # ----- COM1 (Named Pipe) AVANT 1er boot -----
+    $vmGuid = $vm.Id.Guid
+    $com1Path = "\\.\pipe\openhvx-$vmGuid-com1"
+    Set-VMComPort -VMName $Name -Number 1 -Path $com1Path | Out-Null
+    $notes.Add("COM1 named pipe configured: $com1Path") | Out-Null
+
+    # Firmware (Secure Boot) pour Gen2
     if ($Generation -eq 2) {
         if ($SecureBoot) {
             Set-VMFirmware -VMName $Name -EnableSecureBoot On -SecureBootTemplate "MicrosoftUEFICertificateAuthority" | Out-Null
@@ -251,6 +309,7 @@ try {
         }
     }
 
+    # ----- cloud-init files + seed -----
     $tmp = Join-Path $env:TEMP ("cidata-" + [guid]::NewGuid().ToString())
     Ensure-Dir $tmp
     New-CloudInitFiles -dir $tmp -Name $Name -CI $CI
@@ -259,6 +318,7 @@ try {
     Add-VMDvdDrive -VMName $Name -Path $SeedIso | Out-Null
     Remove-Item -Path $tmp -Recurse -Force
 
+    # Ordre de boot (Gen2)
     if ($Generation -eq 2) {
         $sys = Get-VMHardDiskDrive -VMName $Name | Where-Object { $_.Path -eq $VmVhdx }
         if ($sys) { Set-VMFirmware -VMName $Name -FirstBootDevice $sys | Out-Null }
@@ -294,6 +354,11 @@ try {
         }
         cidata     = @{
             format = "iso"
+        }
+        serial     = @{
+            com1 = @{
+                path = $com1Path
+            }
         }
     }
 
