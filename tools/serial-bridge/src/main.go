@@ -1,6 +1,9 @@
 //go:build windows
 // +build windows
 
+// Duplex bridge between serial named pipe and WebSocket
+// Connect to WS-BROKER using a TunnedId
+
 package main
 
 import (
@@ -195,6 +198,7 @@ func main() {
 				errCh <- fmt.Errorf("pipe write: %w", err)
 				return
 			}
+
 		}
 	}()
 

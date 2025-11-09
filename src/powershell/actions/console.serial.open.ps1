@@ -1,6 +1,5 @@
 # powershell/actions/console.serial.open.ps1
-# Démarre le pont série (WS <-> Named Pipe) via openhvx-serial-bridge.exe
-# Non bloquant : lance le binaire et renvoie un JSON { ok, result, notes } immédiatement.
+# Run serial bridge (WS <-> Named Pipe) openhvx-serial-bridge.exe
 
 param(
     [string]$InputJson
@@ -28,10 +27,10 @@ function Get-VmGuidFrom($payload) {
 }
 
 function Get-Com1PipePath([string]$vmGuid) {
-    try { $vm = Get-VM -Id $vmGuid -ErrorAction Stop } catch { throw "VM introuvable par GUID Hyper-V: $vmGuid" }
-    try { $com = Get-VMComPort -VMName $vm.Name -Number 1 -ErrorAction Stop } catch { throw "Impossible de lire le COM1 de '$($vm.Name)'" }
+    try { $vm = Get-VM -Id $vmGuid -ErrorAction Stop } catch { throw "VM not by GUID Hyper-V: $vmGuid" }
+    try { $com = Get-VMComPort -VMName $vm.Name -Number 1 -ErrorAction Stop } catch { throw "Impossible to read COM1 of '$($vm.Name)'" }
     $path = [string]$com.Path
-    if (-not $path) { throw "Aucun COM1 configuré. Configure un Named Pipe sur '$($vm.Name)'." }
+    if (-not $path) { throw "no COM1 configured. Configure a Named Pipe on '$($vm.Name)'." }
     if ($path -notmatch '^\\\\\.\\pipe\\') { throw "COM1 n'est pas un Named Pipe (Path=$path)." }
     return $path
 }
@@ -44,7 +43,6 @@ try {
     $task = Read-TaskInput -Inline $InputJson
     $d = if ($task.PSObject.Properties.Name -contains 'data' -and $task.data) { $task.data } else { $task }
 
-    # 2) Champs requis depuis l’enrichissement
     $wsUrl = [string]$d.agentWsUrl
     $tunnelId = [string]$d.tunnelId
     $ttl = [int]   ($d.ttlSeconds | ForEach-Object { $_ })
@@ -53,20 +51,14 @@ try {
     if (-not $wsUrl) { throw "Missing agentWsUrl in task payload" }
     if (-not $tunnelId) { throw "Missing tunnelId in task payload" }
 
-    # 3) Résoudre GUID VM (Hyper-V) puis COM1
+    # 3) Resolve GUID VM (Hyper-V) then COM1
     $vmGuid = Get-VmGuidFrom $d
     if (-not $vmGuid) { throw "Missing VM GUID (data.id or data.target.refId)" }
 
     $pipePath = Get-Com1PipePath $vmGuid
     $pipeName = Extract-PipeName $pipePath
-
-    # 4) Résoudre le chemin de l'exécutable (dynamique)
-    #    Structure attendue :
-    #       powershell/
-    #         ├─ actions/console.serial.open.ps1  (ce script)
-    #         └─ bin/openhvx-serial-bridge.exe   (binaire Go)
-    $psRoot = $PSScriptRoot                          # ...\powershell\actions
-    $psBase = Split-Path $psRoot -Parent             # ...\powershell
+    $psRoot = $PSScriptRoot                      
+    $psBase = Split-Path $psRoot -Parent             
     $exeCandidates = @(
         (Join-Path $psBase 'bin\openhvx-serial-bridge.exe'),
         (Join-Path $psRoot 'openhvx-serial-bridge.exe'),
@@ -74,10 +66,9 @@ try {
     )
     $exe = $exeCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
     if (-not $exe) {
-        throw "openhvx-serial-bridge.exe introuvable. Cherché: $($exeCandidates -join '; ')"
+        throw "openhvx-serial-bridge.exe not found. WD: $($exeCandidates -join '; ')"
     }
 
-    # 5) Logs (ctx.paths.logs si dispo, sinon %TEMP%)
     $ctx = $d.__ctx
     $logDir = $env:TEMP
     if ($ctx -and $ctx.paths -and $ctx.paths.logs) {
@@ -90,9 +81,8 @@ try {
     $ts = Get-Date -Format 'yyyyMMdd-HHmmss'
     $logBase = Join-Path $logDir ("serial-bridge-$tunnelId-$ts")
     $logOut = "$logBase.out.log"
-    $logErr = "$logBase.err.log"   # ⚠️ doit être différent de $logOut
+    $logErr = "$logBase.err.log" 
 
-    # 6) Construire les arguments (pas de JSON stdin pour éviter quotes/escaping)
     $args = @(
         '-pipe', $pipePath,
         '-ws', $wsUrl,
@@ -101,7 +91,8 @@ try {
         '-v'
     )
 
-    # 7) Lancer le binaire en arrière-plan (non bloquant)
+    #Exec serial-bridge bin
+
     $startParams = @{
         FilePath               = $exe
         ArgumentList           = $args
@@ -111,11 +102,11 @@ try {
         RedirectStandardOutput = $logOut
         RedirectStandardError  = $logErr
     }
+
     $p = Start-Process @startParams
 
     Start-Sleep -Milliseconds 150
     if ($p.HasExited) {
-        # échec immédiat → remonte l’erreur + extrait lignes de log si possible
         $code = $p.ExitCode
         $tailOut = $null; $tailErr = $null
         try { if (Test-Path -LiteralPath $logOut) { $tailOut = (Get-Content -LiteralPath $logOut -Tail 50 -ErrorAction SilentlyContinue) -join "`n" } } catch {}
@@ -126,7 +117,6 @@ try {
         throw $msg
     }
 
-    # 8) Succès → on renvoie un résultat homogène, sans attendre la fin du pont
     $result = [pscustomobject]@{
         started  = $true
         pid      = $p.Id
@@ -145,21 +135,20 @@ try {
         ok     = $true
         result = $result
         notes  = @(
-            "Bridge lancé en arrière-plan; logs OUT: $logOut",
+            "Bridge running in background; logs OUT: $logOut",
             "Logs ERR: $logErr",
-            "Le TTL et/ou la fermeture des sockets mettront fin au process automatiquement."
+            "TTL and/or socket termination will kill the process automatically"
         )
     } | ConvertTo-Json -Depth 6 -Compress
     exit 0
 }
 catch {
     $err = $_.Exception.Message
-    # On tente d'ajouter une aide si le pipe est présent/absent
     try {
         $hint = $null
         if ($pipeName) {
             $pipeExists = Test-Path "\\.\pipe\$pipeName"
-            $hint = if ($pipeExists) { "Le Named Pipe existe; verifier droits/instance." } else { "Le Named Pipe n'existe pas encore; demarrer la VM et re-tester." }
+            $hint = if ($pipeExists) { "Named pipe exist; please verify rights/instances." } else { "Named pipe doesnt exist." }
         }
         $payload = [pscustomobject]@{ ok = $false; error = $err }
         if ($hint) { $payload | Add-Member -NotePropertyName hint -NotePropertyValue $hint }
