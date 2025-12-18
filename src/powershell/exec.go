@@ -58,9 +58,13 @@ func RunActionScript(action string, data map[string]any) ([]byte, error) {
 
 	// Echec 1 "classique"
 	if len(out) > 0 {
+		if len(stderr) > 0 {
+			return out, errors.New("action script failed: " + strings.TrimSpace(string(stderr)))
+		}
 		return out, errors.New("action script failed")
 	}
 	return nil, errors.New("action script failed: " + strings.TrimSpace(string(stderr)))
+
 }
 
 func runPwsh(ps string, args []string, stdin []byte) ([]byte, []byte, error) {

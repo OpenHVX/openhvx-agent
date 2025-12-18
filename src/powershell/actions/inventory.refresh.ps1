@@ -1,3 +1,4 @@
+
 # powershell/actions/inventory.refresh.ps1
 # Sortie: objet JSON { ok, result, error }
 # - result.inventory.inventory  : inventaire Hyper-V (host, réseaux, stockage, VMs)
@@ -295,6 +296,21 @@ function Get-VM-NICs {
   return , $items
 }
 
+function Get-IscsiIqnByDiskNumber {
+  param([Parameter(Mandatory = $true)][int]$DiskNumber)
+  try {
+    $sessions = Get-WmiObject -Namespace ROOT\WMI -Class MSiSCSIInitiator_SessionClass -ErrorAction Stop
+    foreach ($s in $sessions) {
+      if (-not $s.Devices) { continue }
+      foreach ($dev in $s.Devices) {
+        if ($dev.DeviceNumber -eq $DiskNumber) { return $s.TargetName }
+      }
+    }
+  }
+  catch {}
+  return $null
+}
+
 function Get-VM-Disks {
   param([string]$VmName)
   $items = @()
@@ -302,12 +318,19 @@ function Get-VM-Disks {
     $hdds = Get-VMHardDiskDrive -VMName $VmName
     foreach ($h in $hdds) {
       $vhd = $null
+      $diskNumber = $h.DiskNumber
+      $iqn = $null
+      if ($null -ne $diskNumber) {
+        $iqn = Get-IscsiIqnByDiskNumber -DiskNumber $diskNumber
+      }
       try { if ($h.Path) { $vhd = Get-VHD -Path $h.Path } } catch {}
       $items += [pscustomobject]@{
         controllerType   = "$($h.ControllerType)"     # IDE/SCSI
         controllerNumber = $h.ControllerNumber
         controllerSlot   = $h.ControllerLocation
         path             = $h.Path
+        diskNumber       = $diskNumber
+        iqn              = $iqn
         vhd              = if ($vhd) {
           [pscustomobject]@{
             format             = "$($vhd.VhdFormat)"         # VHD/VHDX
@@ -450,75 +473,150 @@ function Get-VMList {
 }
 
 # ===================== MAIN =====================
+# ===================== MAIN (Canonized Inventory) =====================
 try {
   # 1) Lire les paramètres (arg ou STDIN) + extraire le contexte
   $Params = Read-ParamsJson -Inline $InputJson
   $ctx = $Params.__ctx
 
   # Préférence: __ctx (injecté par l'agent pour les tasks)
-  $basePath = $null
-  $datastores = $null
-  $imagesIn = @()
+  $basePath = $ctx.basePath
+  $datastores = $ctx.datastores
+  $agentId = $ctx.agentId
 
-  if ($ctx) {
-    if ($ctx.basePath) { $basePath = $ctx.basePath }
-    if ($ctx.datastores) { $datastores = $ctx.datastores }
-    if ($ctx.images) { $imagesIn = $ctx.images }
-    # si pas de datastores mais des paths normés, on peut reconstruire un défaut
-    if (-not $datastores -and $ctx.paths -and $ctx.paths.root) {
-      $datastores = Build-DefaultDatastores -BasePath (Split-Path -Path $ctx.paths.root -Parent)
-    }
-  }
-
-  # Fallback compat (inventaire périodique appelle encore basePath/datastores/images)
-  if (-not $basePath -and $Params.basePath) { $basePath = $Params.basePath }
+  # Fallback compat (inventaire périodique)
+  if (-not $agentId) { $agentId = $env:COMPUTERNAME }
+  if (-not $basePath) { $basePath = $Params.basePath }
   if (-not $datastores -and $Params.datastores) { $datastores = $Params.datastores }
-  if ($Params.images) { $imagesIn = $Params.images }
-
-  if (-not $datastores -and $basePath) { $datastores = Build-DefaultDatastores -BasePath $basePath }
   if (-not $datastores) { $datastores = @() }
-  if (-not $imagesIn) { $imagesIn = @() }
 
-  # 2) Inventaire Hyper-V (branche "inventory.inventory")
+  # 2) Collecte Hyper-V brute
   $hostInfo = Get-HostInfo
   $switches = Get-VSwitches
   $adapters = Get-HostAdapters
   Map-VSwitchToHostAdapters -switches $switches -hostAdapters $adapters
-  $storage = Get-StorageInventory
   $vms = Get-VMList
 
-  $inventoryStruct = [pscustomobject]@{
-    host        = $hostInfo
-    networks    = [pscustomobject]@{
-      switches     = $switches
-      hostAdapters = $adapters
+  # 3) Canon host
+  $hostCanon = [pscustomobject]@{
+    hostname   = $hostInfo.hostname
+    os         = $hostInfo.os
+    hypervisor = 'hyperv'
+    cpu        = @{
+      sockets = $null      # TODO si besoin
+      cores   = $hostInfo.cpu.cores
+      threads = $hostInfo.cpu.logicalProcessors
+      model   = $hostInfo.cpu.name
     }
-    storage     = $storage
-    vms         = $vms
-    collectedAt = (Get-Date).ToUniversalTime().ToString("o")
+    memoryMb   = $hostInfo.memMB
+    provider   = @{
+      hyperv = @{
+        osVersion = $hostInfo.osVersion
+        domain    = $hostInfo.domain
+      }
+    }
   }
 
-  # 3) Datastores -> capacité/ libre (branche "inventory.datastores")
-  $dsOut = @()
-  foreach ($ds in $datastores) {
-    $p = [string]$ds.path
-    if (-not $p) { continue }
-    $u = Get-DriveUsage -Path $p
-    $dsOut += [ordered]@{
-      name       = $ds.name
-      kind       = $ds.kind
-      path       = $p
-      drive      = $u.drive
-      totalBytes = $u.totalBytes
-      freeBytes  = $u.freeBytes
+  # 4) Canon networks
+  $networksCanon = @()
+  foreach ($sw in $switches) {
+    $networksCanon += [pscustomobject]@{
+      id       = $sw.name
+      name     = $sw.name
+      type     = $sw.type
+      role     = @()
+      provider = @{
+        hyperv = @{
+          uplinks    = $sw.uplinks
+          extensions = $sw.extensions
+        }
+      }
     }
   }
-  # 4) Sortie finale { ok, result, error }
-  #    IMPORTANT: on regroupe sous result.inventory.{ inventory, datastores, images }
-  [pscustomobject]@{
-    inventory  = $inventoryStruct
-    datastores = $dsOut
-  } | ConvertTo-Json -Depth 12
+
+  # 5) Canon datastores
+  $datastoresCanon = @()
+  foreach ($ds in $datastores) {
+    $usage = Get-DriveUsage -Path $ds.path
+    $datastoresCanon += [pscustomobject]@{
+      id        = $ds.kind
+      name      = $ds.name
+      kind      = $ds.kind
+      path      = $ds.path
+      sizeBytes = $usage.totalBytes
+      freeBytes = $usage.freeBytes
+      provider  = @{
+        hyperv = @{
+          drive = $usage.drive
+        }
+      }
+    }
+  }
+
+  # 6) Canon VMs
+  $vmsCanon = @()
+  foreach ($vm in $vms) {
+    # CPU / RAM
+    $vcpus = $vm.configuration.cpu.count
+    $memMb = if ($vm.configuration.memory) { $vm.configuration.memory.startupMB } else { $vm.memoryAssignedMB }
+
+    # Disks
+    $disksCanon = @()
+    foreach ($d in $vm.storage) {
+      $sizeBytes = if ($d.vhd) { [int64]($d.vhd.sizeMB * 1MB) } else { 0 }
+      $disksCanon += [pscustomobject]@{
+        id          = $d.path
+        path        = $d.path
+        sizeBytes   = $sizeBytes
+        diskNumber  = $d.diskNumber
+        iqn         = $d.iqn
+        boot        = $false
+        datastoreId = $null
+      }
+    }
+
+    # NICs
+    $nicsCanon = @()
+    foreach ($n in $vm.networkAdapters) {
+      $nicsCanon += [pscustomobject]@{
+        id          = $n.name
+        networkId   = $n.switch
+        macAddress  = $n.mac
+        primary     = $false
+        ipAddresses = $n.ips
+      }
+    }
+
+    $vmsCanon += [pscustomobject]@{
+      id         = $vm.id
+      name       = $vm.name
+      powerState = $vm.state
+      cpu        = @{ vcpus = $vcpus }
+      memoryMb   = $memMb
+      disks      = $disksCanon
+      nics       = $nicsCanon
+      provider   = @{
+        hyperv = @{
+          generation     = $vm.generation
+          cpuUsagePct    = $vm.cpuUsagePct
+          automaticStart = $vm.automaticStart
+          automaticStop  = $vm.automaticStop
+        }
+      }
+    }
+  }
+
+  # 7) Canon inventory final
+  $canonicalInventory = [pscustomobject]@{
+    schemaVersion = "1.0.0"
+    collectedAt   = (Get-Date).ToUniversalTime().ToString("o")
+    host          = $hostCanon
+    networks      = $networksCanon
+    datastores    = $datastoresCanon
+    vms           = $vmsCanon
+  }
+
+  $canonicalInventory | ConvertTo-Json -Depth 15
   exit 0
 }
 catch {

@@ -72,6 +72,7 @@ func StartTaskConsumer(agentID string, handle HandlerFunc) error {
 				_ = d.Nack(false, false) // drop poison
 				continue
 			}
+
 			// Ignore si le message cible un autre agent
 			if t.AgentID != "" && t.AgentID != agentID {
 				_ = d.Ack(false)

@@ -63,6 +63,23 @@ function Invoke-WithRetry {
     }
     return $false
 }
+function Get-VmNamesUsingDiskNumber {
+    param([Parameter(Mandatory = $true)][int]$DiskNumber)
+    $names = @()
+    try {
+        $vms = Get-VM
+        foreach ($v in $vms) {
+            $hdds = Get-VMHardDiskDrive -VMName $v.Name -ErrorAction SilentlyContinue
+            foreach ($h in $hdds) {
+                if ($null -ne $h.DiskNumber -and $h.DiskNumber -eq $DiskNumber) {
+                    $names += $v.Name
+                }
+            }
+        }
+    }
+    catch {}
+    return $names
+}
 
 try {
     # === Lecture via -InputJson ===
@@ -102,7 +119,17 @@ try {
     $vm = $null
     if ($Id) { try { $vm = Get-VM -Id $Id -ErrorAction Stop } catch {} }
     if (-not $vm -and $Name) { try { $vm = Get-VM -Name $Name -ErrorAction Stop } catch {} }
-    if (-not $vm) { throw "VM not found (id='$Id', name='$Name')" }
+    if (-not $vm) {
+        $result = @{
+            deleted  = $false
+            notFound = $true
+            name     = $Name
+            id       = $Id
+            guid     = $Id
+        }
+        @{ vm = $result } | ConvertTo-Json -Depth 6
+        exit 0
+    }
 
     $vmGuid = "$($vm.Id)"; $vmName = $vm.Name
     $wasRunning = ($vm.State -in 'Running', 'Paused', 'Saving', 'Starting')
@@ -113,6 +140,7 @@ try {
     try { $dvdObjs = Get-VMDvdDrive      -VMName $vmName -ErrorAction SilentlyContinue } catch {}
 
     $hddPaths = @($hddObjs | Where-Object { $_.Path } | Select-Object -Expand Path)
+    $passThroughNumbers = @($hddObjs | Where-Object { $_.DiskNumber -ne $null } | Select-Object -ExpandProperty DiskNumber -Unique)
     $isoPaths = @($dvdObjs | Where-Object { $_.Path } | Select-Object -Expand Path)
     $diskPaths = @($hddPaths + $isoPaths) | Where-Object { $_ } | Select-Object -Unique
 
@@ -160,6 +188,14 @@ try {
             Remove-VMHardDiskDrive -VMName $vmName -ControllerType $h.ControllerType -ControllerNumber $h.ControllerNumber -ControllerLocation $h.ControllerLocation -ErrorAction SilentlyContinue
         }
         catch {}
+    }
+
+    # === Remettre en ligne les disques iSCSI pass-through ===
+    foreach ($n in $passThroughNumbers) {
+        if ($null -eq $n) { continue }
+        $inUseBy = @(Get-VmNamesUsingDiskNumber -DiskNumber $n)
+        if ($inUseBy.Count -gt 0) { continue }
+        try { Set-Disk -Number $n -IsOffline $false | Out-Null } catch {}
     }
 
     # === Préparer Trash si nécessaire ===
@@ -229,7 +265,11 @@ try {
     }
 
     # === Supprimer la VM (config) en dernier ===
-    Remove-VM -Name $vmName -Force -ErrorAction Stop
+    try { Remove-VM -Name $vmName -Force -ErrorAction Stop } catch {
+        $vmGone = $false
+        try { $vmGone = -not (Get-VM -Name $vmName -ErrorAction SilentlyContinue) } catch {}
+        if (-not $vmGone) { throw }
+    }
 
     $result = @{
         deleted      = $true
