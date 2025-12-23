@@ -3,8 +3,10 @@ package amqp
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
+	"sync"
 	"time"
 
 	amqp091 "github.com/rabbitmq/amqp091-go"
@@ -16,40 +18,19 @@ const (
 	ResultsEx   = "results"         // topic
 )
 
-var conn *amqp091.Connection
-var ch *amqp091.Channel
+var (
+	conn    *amqp091.Connection
+	ch      *amqp091.Channel
+	amqpURL string
+	connMu  sync.Mutex
+)
 
-func InitPublisher(amqpURL string) error {
-	var err error
+func InitPublisher(url string) error {
+	amqpURL = url
 
-	conn, err = amqp091.Dial(amqpURL)
-	if err != nil {
-		return fmt.Errorf("amqp dial: %w", err)
+	if _, err := ensureChannelWithRetry(3, 2*time.Second); err != nil {
+		return err
 	}
-
-	ch, err = conn.Channel()
-	if err != nil {
-		return fmt.Errorf("amqp channel: %w", err)
-	}
-
-	// Exchanges (idempotent; mêmes paramètres partout)
-	if err := ch.ExchangeDeclare(JobsEx, "direct", true, false, false, false, nil); err != nil {
-		return fmt.Errorf("declare exchange %s: %w", JobsEx, err)
-	}
-	if err := ch.ExchangeDeclare(TelemetryEx, "topic", true, false, false, false, nil); err != nil {
-		return fmt.Errorf("declare exchange %s: %w", TelemetryEx, err)
-	}
-	if err := ch.ExchangeDeclare(ResultsEx, "topic", true, false, false, false, nil); err != nil {
-		return fmt.Errorf("declare exchange %s: %w", ResultsEx, err)
-	}
-
-	// (optionnel) log des publish "mandatory" non routés
-	retCh := ch.NotifyReturn(make(chan amqp091.Return, 1))
-	go func() {
-		for r := range retCh {
-			log.Printf("[AMQP] UNROUTABLE publish corrId=%s rk=%s", r.CorrelationId, r.RoutingKey)
-		}
-	}()
 
 	return nil
 }
@@ -61,6 +42,10 @@ func ClosePublisher() {
 	if conn != nil {
 		_ = conn.Close()
 	}
+	connMu.Lock()
+	defer connMu.Unlock()
+	ch = nil
+	conn = nil
 }
 
 type heartbeat struct {
@@ -83,16 +68,18 @@ func PublishHeartbeat(agentID string, host string, caps []string) error {
 	body, _ := json.Marshal(hb)
 	rk := "heartbeat." + agentID
 
-	return ch.Publish(
-		TelemetryEx, rk,
-		true,  // mandatory
-		false, // immediate
-		amqp091.Publishing{
-			ContentType:  "application/json",
-			DeliveryMode: amqp091.Persistent,
-			Body:         body,
-		},
-	)
+	return publishWithRetry(func(c *amqp091.Channel) error {
+		return c.Publish(
+			TelemetryEx, rk,
+			true,  // mandatory
+			false, // immediate
+			amqp091.Publishing{
+				ContentType:  "application/json",
+				DeliveryMode: amqp091.Persistent,
+				Body:         body,
+			},
+		)
+	})
 }
 
 type inventoryEnvelope struct {
@@ -113,19 +100,20 @@ func PublishInventoryJSON(agentID string, invJSON []byte) error {
 
 	log.Println("[AMQP] Publishing inventory (FULL) to", TelemetryEx, "rk=", rk)
 
-	return ch.Publish(
-		TelemetryEx, rk,
-		true,  // mandatory -> log via NotifyReturn si non routé
-		false, // immediate
-		amqp091.Publishing{
-			ContentType:  "application/json",
-			DeliveryMode: amqp091.Persistent,
-			Body:         body,
-		},
-	)
+	return publishWithRetry(func(c *amqp091.Channel) error {
+		return c.Publish(
+			TelemetryEx, rk,
+			true,  // mandatory -> log via NotifyReturn si non routé
+			false, // immediate
+			amqp091.Publishing{
+				ContentType:  "application/json",
+				DeliveryMode: amqp091.Persistent,
+				Body:         body,
+			},
+		)
+	})
 }
 
-// ======= ⬇️ Manquait : définition du type d'options pour WithMeta ⬇️
 type InventoryPublishOpts struct {
 	AgentID   string
 	Body      []byte
@@ -133,8 +121,6 @@ type InventoryPublishOpts struct {
 	MergeMode string            // "patch-nondestructive" | "replace" | "raw"
 	Headers   map[string]string // optionnel
 }
-
-// ======= ⬆️ Fin du bloc manquant ⬆️
 
 type inventoryEnvelopeMeta struct {
 	AgentID   string          `json:"agentId"`
@@ -145,9 +131,6 @@ type inventoryEnvelopeMeta struct {
 }
 
 func PublishInventoryJSONWithMeta(opts InventoryPublishOpts) error {
-	if ch == nil {
-		return fmt.Errorf("AMQP channel not initialized")
-	}
 	// Harmonisation: même topic pattern que PublishInventoryJSON
 	rk := "inventory." + opts.AgentID
 
@@ -172,15 +155,151 @@ func PublishInventoryJSONWithMeta(opts InventoryPublishOpts) error {
 
 	log.Println("[AMQP] Publishing inventory (LIGHT) to", TelemetryEx, "rk=", rk)
 
-	return ch.Publish(
-		TelemetryEx, rk,
-		true,  // mandatory
-		false, // immediate
-		amqp091.Publishing{
-			ContentType:  "application/json",
-			DeliveryMode: amqp091.Persistent,
-			Headers:      h,
-			Body:         body,
-		},
-	)
+	return publishWithRetry(func(c *amqp091.Channel) error {
+		return c.Publish(
+			TelemetryEx, rk,
+			true,  // mandatory
+			false, // immediate
+			amqp091.Publishing{
+				ContentType:  "application/json",
+				DeliveryMode: amqp091.Persistent,
+				Headers:      h,
+				Body:         body,
+			},
+		)
+	})
+}
+
+// --------- Internals (reconnexion + canal) ----------
+
+func ensureChannelWithRetry(attempts int, delay time.Duration) (*amqp091.Channel, error) {
+	var lastErr error
+	for i := 0; attempts == 0 || i < attempts; i++ {
+		c, err := ensureChannel()
+		if err == nil {
+			return c, nil
+		}
+		lastErr = err
+		log.Printf("[AMQP] channel ensure failed (try %d): %v", i+1, err)
+		time.Sleep(delay)
+	}
+	return nil, fmt.Errorf("amqp channel init failed after %d attempts: %w", attempts, lastErr)
+}
+
+func ensureChannel() (*amqp091.Channel, error) {
+	connMu.Lock()
+	defer connMu.Unlock()
+
+	if ch != nil && !ch.IsClosed() && conn != nil && !conn.IsClosed() {
+		return ch, nil
+	}
+
+	// Nettoie l'état précédent
+	if ch != nil {
+		_ = ch.Close()
+		ch = nil
+	}
+	if conn != nil {
+		_ = conn.Close()
+		conn = nil
+	}
+
+	if amqpURL == "" {
+		return nil, errors.New("amqp url is empty")
+	}
+
+	c, err := amqp091.Dial(amqpURL)
+	if err != nil {
+		return nil, fmt.Errorf("amqp dial: %w", err)
+	}
+
+	newCh, err := c.Channel()
+	if err != nil {
+		_ = c.Close()
+		return nil, fmt.Errorf("amqp channel: %w", err)
+	}
+
+	if err := declareExchanges(newCh); err != nil {
+		_ = newCh.Close()
+		_ = c.Close()
+		return nil, err
+	}
+	startReturnLogger(newCh)
+
+	conn = c
+	ch = newCh
+	return ch, nil
+}
+
+func declareExchanges(c *amqp091.Channel) error {
+	if err := c.ExchangeDeclare(JobsEx, "direct", true, false, false, false, nil); err != nil {
+		return fmt.Errorf("declare exchange %s: %w", JobsEx, err)
+	}
+	if err := c.ExchangeDeclare(TelemetryEx, "topic", true, false, false, false, nil); err != nil {
+		return fmt.Errorf("declare exchange %s: %w", TelemetryEx, err)
+	}
+	if err := c.ExchangeDeclare(ResultsEx, "topic", true, false, false, false, nil); err != nil {
+		return fmt.Errorf("declare exchange %s: %w", ResultsEx, err)
+	}
+	return nil
+}
+
+func publishWithRetry(fn func(*amqp091.Channel) error) error {
+	var lastErr error
+	for i := 0; i < 3; i++ {
+		c, err := ensureChannel()
+		if err != nil {
+			lastErr = err
+			time.Sleep(2 * time.Second)
+			continue
+		}
+
+		if err := fn(c); err != nil {
+			lastErr = err
+			if isConnErr(err) {
+				resetConnection()
+				time.Sleep(2 * time.Second)
+				continue
+			}
+			return err
+		}
+		return nil
+	}
+	return lastErr
+}
+
+func isConnErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, amqp091.ErrClosed) {
+		return true
+	}
+	var amqErr *amqp091.Error
+	if errors.As(err, &amqErr) {
+		return true
+	}
+	return false
+}
+
+func resetConnection() {
+	connMu.Lock()
+	defer connMu.Unlock()
+	if ch != nil {
+		_ = ch.Close()
+	}
+	if conn != nil {
+		_ = conn.Close()
+	}
+	ch = nil
+	conn = nil
+}
+
+func startReturnLogger(c *amqp091.Channel) {
+	retCh := c.NotifyReturn(make(chan amqp091.Return, 1))
+	go func() {
+		for r := range retCh {
+			log.Printf("[AMQP] UNROUTABLE publish corrId=%s rk=%s", r.CorrelationId, r.RoutingKey)
+		}
+	}()
 }

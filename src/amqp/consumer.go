@@ -29,41 +29,71 @@ type Task struct {
 
 type HandlerFunc func(Task) (any, error)
 
-// ⚠️ Appelle d'abord InitPublisher(...) (dans publisher.go) pour initialiser conn/ch
 func StartTaskConsumer(agentID string, handle HandlerFunc) error {
-	if ch == nil || conn == nil {
-		return fmt.Errorf("AMQP not initialized: call InitPublisher(...) first")
+	if agentID == "" {
+		return fmt.Errorf("agentID is required")
+	}
+	if handle == nil {
+		return fmt.Errorf("task handler is required")
 	}
 
+	if _, err := ensureChannelWithRetry(3, 2*time.Second); err != nil {
+		return fmt.Errorf("AMQP not initialized: %w", err)
+	}
+
+	go consumeLoop(agentID, handle)
+	return nil
+}
+
+func consumeLoop(agentID string, handle HandlerFunc) {
 	queueName := fmt.Sprintf("agent.%s.tasks", agentID)
 
-	// Queue et binding vers l'exchange jobs (rk = agentID)
-	if _, err := ch.QueueDeclare(queueName, true, false, false, false, nil); err != nil {
-		return fmt.Errorf("declare %s: %w", queueName, err)
-	}
-	if err := ch.QueueBind(queueName, agentID, JobsEx, false, nil); err != nil {
-		return fmt.Errorf("bind %s to %s: %w", queueName, JobsEx, err)
-	}
+	for {
+		c, err := ensureChannelWithRetry(0, 3*time.Second)
+		if err != nil {
+			log.Printf("[AMQP] consumer channel error: %v (retrying in 5s)", err)
+			time.Sleep(5 * time.Second)
+			continue
+		}
 
-	// Limiter les messages non-ack en vol
-	if err := ch.Qos(5, 0, false); err != nil {
-		return fmt.Errorf("qos: %w", err)
-	}
+		// Queue et binding vers l'exchange jobs (rk = agentID)
+		if _, err := c.QueueDeclare(queueName, true, false, false, false, nil); err != nil {
+			log.Printf("[AMQP] declare %s: %v", queueName, err)
+			resetConnection()
+			time.Sleep(3 * time.Second)
+			continue
+		}
+		if err := c.QueueBind(queueName, agentID, JobsEx, false, nil); err != nil {
+			log.Printf("[AMQP] bind %s to %s: %v", queueName, JobsEx, err)
+			resetConnection()
+			time.Sleep(3 * time.Second)
+			continue
+		}
 
-	msgs, err := ch.Consume(
-		queueName,
-		"agent-"+agentID, // consumer tag
-		false,            // autoAck=false
-		false,            // exclusive
-		false,            // noLocal
-		false,            // noWait
-		nil,
-	)
-	if err != nil {
-		return fmt.Errorf("consume: %w", err)
-	}
+		// Limiter les messages non-ack en vol
+		if err := c.Qos(5, 0, false); err != nil {
+			log.Printf("[AMQP] qos error: %v", err)
+			resetConnection()
+			time.Sleep(3 * time.Second)
+			continue
+		}
 
-	go func() {
+		msgs, err := c.Consume(
+			queueName,
+			"agent-"+agentID, // consumer tag
+			false,            // autoAck=false
+			false,            // exclusive
+			false,            // noLocal
+			false,            // noWait
+			nil,
+		)
+		if err != nil {
+			log.Printf("[AMQP] consume setup error: %v (retrying)", err)
+			resetConnection()
+			time.Sleep(3 * time.Second)
+			continue
+		}
+
 		log.Printf("[AMQP] consuming %s ...", queueName)
 		for d := range msgs {
 			var t Task
@@ -120,7 +150,7 @@ func StartTaskConsumer(agentID string, handle HandlerFunc) error {
 			b, _ := json.Marshal(res)
 
 			rk := "task." + t.TaskID
-			if err := ch.Publish(
+			if err := c.Publish(
 				ResultsEx, rk,
 				true,  // mandatory
 				false, // immediate
@@ -136,8 +166,8 @@ func StartTaskConsumer(agentID string, handle HandlerFunc) error {
 
 			// ---- Optionnel: compat queue replyTo ----
 			if t.ReplyTo != "" {
-				_, _ = ch.QueueDeclare(t.ReplyTo, true, false, false, false, nil)
-				if err := ch.Publish(
+				_, _ = c.QueueDeclare(t.ReplyTo, true, false, false, false, nil)
+				if err := c.Publish(
 					"", t.ReplyTo,
 					true,
 					false,
@@ -157,8 +187,7 @@ func StartTaskConsumer(agentID string, handle HandlerFunc) error {
 				go AfterResult(t) // non bloquant
 			}
 		}
-		log.Printf("[AMQP] consumer stopped for %s", queueName)
-	}()
-
-	return nil
+		log.Printf("[AMQP] consumer stopped for %s (channel closed?), retrying...", queueName)
+		time.Sleep(2 * time.Second)
+	}
 }

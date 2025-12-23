@@ -80,6 +80,27 @@ function Get-VmNamesUsingDiskNumber {
     catch {}
     return $names
 }
+function Get-IscsiSessionsByDiskNumber {
+    param([Parameter(Mandatory = $true)][int]$DiskNumber)
+    $matches = @()
+    try {
+        $sessions = Get-WmiObject -Namespace ROOT\WMI -Class MSiSCSIInitiator_SessionClass -ErrorAction Stop
+        foreach ($s in $sessions) {
+            if (-not $s.Devices) { continue }
+            foreach ($dev in $s.Devices) {
+                if ($dev.DeviceNumber -eq $DiskNumber) {
+                    $matches += [pscustomobject]@{
+                        sessionId  = $s.SessionId
+                        targetName = $s.TargetName
+                    }
+                    break
+                }
+            }
+        }
+    }
+    catch {}
+    return , $matches
+}
 
 try {
     # === Lecture via -InputJson ===
@@ -190,11 +211,26 @@ try {
         catch {}
     }
 
-    # === Remettre en ligne les disques iSCSI pass-through ===
+    # === Detach iSCSI or bring online pass-through disks ===
     foreach ($n in $passThroughNumbers) {
         if ($null -eq $n) { continue }
         $inUseBy = @(Get-VmNamesUsingDiskNumber -DiskNumber $n)
         if ($inUseBy.Count -gt 0) { continue }
+
+        $iscsiSessions = @(Get-IscsiSessionsByDiskNumber -DiskNumber $n | Where-Object { $_ })
+        if ($iscsiSessions.Count -gt 0) {
+            $targets = @()
+            foreach ($sess in $iscsiSessions) {
+                if ($sess.targetName) { $targets += $sess.targetName }
+                try { Disconnect-IscsiTarget -SessionIdentifier $sess.sessionId -Confirm:$false -ErrorAction Stop | Out-Null }
+                catch {}
+            }
+            foreach ($t in ($targets | Select-Object -Unique)) {
+                try { Disconnect-IscsiTarget -NodeAddress $t -Confirm:$false -ErrorAction SilentlyContinue | Out-Null } catch {}
+            }
+            continue
+        }
+
         try { Set-Disk -Number $n -IsOffline $false | Out-Null } catch {}
     }
 

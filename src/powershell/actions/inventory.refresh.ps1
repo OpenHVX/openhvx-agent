@@ -577,15 +577,19 @@ try {
 
     # NICs
     $nicsCanon = @()
+    $vmIpAddresses = @()
     foreach ($n in $vm.networkAdapters) {
+      $nicIps = $n.ips | Where-Object { $_ }
+      $vmIpAddresses += $nicIps
       $nicsCanon += [pscustomobject]@{
         id          = $n.name
         networkId   = $n.switch
         macAddress  = $n.mac
         primary     = $false
-        ipAddresses = $n.ips
+        ipAddresses = $nicIps
       }
     }
+    $vmIpAddresses = $vmIpAddresses | Where-Object { $_ } | Select-Object -Unique
 
     $vmsCanon += [pscustomobject]@{
       id         = $vm.id
@@ -593,6 +597,7 @@ try {
       powerState = $vm.state
       cpu        = @{ vcpus = $vcpus }
       memoryMb   = $memMb
+      ipAddresses = $vmIpAddresses
       disks      = $disksCanon
       nics       = $nicsCanon
       provider   = @{

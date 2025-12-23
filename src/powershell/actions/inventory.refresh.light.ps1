@@ -35,12 +35,13 @@ function Get-VM-Light {
                 $adapters = Get-VMNetworkAdapter -VMName $v.Name -ErrorAction Stop
                 foreach ($n in $adapters) {
                     $ips = @(); try { $ips = $n.IPAddresses } catch {}
+                    $nicIps = $ips | Where-Object { $_ }
                     $nics += [pscustomobject]@{
                         id          = $n.Name
                         networkId   = $n.SwitchName
                         macAddress  = $n.MacAddress
                         primary     = $false
-                        ipAddresses = $ips
+                        ipAddresses = $nicIps
                     }
                 }
             }
