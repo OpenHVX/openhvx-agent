@@ -1,3 +1,4 @@
+param([string]$InputJson)
 # actions/vm.power.ps1 — format attendu sur STDIN:
 # { "action":"vm.power", "data": { "__ctx":{...}, "guid":"...", "id":"...", "state":"start|off|...", "target": { "kind":"vm","agentId":"...","refId":"..." } } }
 
@@ -9,7 +10,6 @@ $DbgDir = 'C:\ProgramData\openhvx\debug\vm.power'
 try { New-Item -ItemType Directory -Force -Path $DbgDir | Out-Null } catch {}
 $raw = [Console]::In.ReadToEnd()
 $stamp = (Get-Date).ToString('yyyy-MM-dd_HH-mm-ss.fff')
-try { Set-Content -LiteralPath (Join-Path $DbgDir "stdin_$stamp.json") -Value $raw -Encoding UTF8 -Force } catch {}
 
 function Get-VmByIdOrName {
   param([Parameter(Mandatory = $true)][string]$IdOrName)
@@ -31,7 +31,7 @@ function Normalize-State {
   switch ($s.ToLowerInvariant()) {
     'on' { 'start' } 'start' { 'start' } 'poweron' { 'start' }
     'off' { 'off' } 'poweroff' { 'off' }
-    'shutdown' { 'shutdown' }
+    'shutdown' { 'shutdown' } 'stop' { 'shutdown' }
     'restart' { 'restart' } 'reboot' { 'restart' }
     'pause' { 'pause' } 'suspend' { 'pause' }
     'resume' { 'resume' }

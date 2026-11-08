@@ -1,0 +1,42 @@
+name: Agent checks
+on:
+  push:
+  pull_request:
+jobs:
+  agent:
+    runs-on: ubuntu-latest
+    services:
+      rabbitmq:
+        image: rabbitmq:3-management
+        env:
+          RABBITMQ_DEFAULT_USER: integration
+          RABBITMQ_DEFAULT_PASS: integration-only-password
+        ports:
+          - 5672:5672
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
+          --health-interval 5s --health-timeout 5s --health-retries 30
+    env:
+      AMQP_INTEGRATION_URL: amqp://integration:integration-only-password@127.0.0.1:5672/
+    defaults:
+      run:
+        working-directory: src
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: src/go.mod
+          cache-dependency-path: src/go.sum
+      - run: go vet ./...
+      - name: Parse active PowerShell actions
+        shell: pwsh
+        run: ./powershell/tests/parse.ps1
+      - run: go test -race ./...
+      - run: go build ./...
+      - run: GOOS=windows GOARCH=amd64 go build -o "$RUNNER_TEMP/openhvx-agent.exe" .
+      - name: Build Windows serial bridge
+        working-directory: tools/serial-bridge/src
+        run: GOOS=windows GOARCH=amd64 go build -o "$RUNNER_TEMP/openhvx-serial-bridge.exe" .
+      - name: Build Windows cloud-init helper
+        working-directory: tools/cloudinit-iso/src
+        run: GOOS=windows GOARCH=amd64 go build -o "$RUNNER_TEMP/openhvx-cidata-iso.exe" .

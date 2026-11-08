@@ -2,10 +2,12 @@
 package amqp
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"sync"
 	"time"
 
@@ -26,7 +28,13 @@ var (
 )
 
 func InitPublisher(url string) error {
+	kind := os.Getenv("AMQP_QUEUE_TYPE")
+	if kind != "" && kind != "classic" && kind != "quorum" {
+		return errors.New("AMQP_QUEUE_TYPE must be classic or quorum")
+	}
+	connMu.Lock()
 	amqpURL = url
+	connMu.Unlock()
 
 	if _, err := ensureChannelWithRetry(3, 2*time.Second); err != nil {
 		return err
@@ -36,14 +44,14 @@ func InitPublisher(url string) error {
 }
 
 func ClosePublisher() {
+	connMu.Lock()
+	defer connMu.Unlock()
 	if ch != nil {
 		_ = ch.Close()
 	}
 	if conn != nil {
 		_ = conn.Close()
 	}
-	connMu.Lock()
-	defer connMu.Unlock()
 	ch = nil
 	conn = nil
 }
@@ -302,4 +310,59 @@ func startReturnLogger(c *amqp091.Channel) {
 			log.Printf("[AMQP] UNROUTABLE publish corrId=%s rk=%s", r.CorrelationId, r.RoutingKey)
 		}
 	}()
+}
+
+// Dedicated channels scope confirms and returns to one persisted result.
+func sharedConnectionChannel(_ *amqp091.Channel) (*amqp091.Channel, error) {
+	connMu.Lock()
+	defer connMu.Unlock()
+	if conn == nil || conn.IsClosed() {
+		return nil, amqp091.ErrClosed
+	}
+	return conn.Channel()
+}
+func queueOptions() amqp091.Table {
+	kind := os.Getenv("AMQP_QUEUE_TYPE")
+	if kind == "" {
+		kind = "classic"
+	}
+	return amqp091.Table{"x-queue-type": kind}
+}
+func publishConfirmed(parent context.Context, exchange, key string, body []byte, eventID string) error {
+	ctx, cancel := context.WithTimeout(parent, 15*time.Second)
+	defer cancel()
+	shared, err := ensureChannelWithRetry(3, time.Second)
+	if err != nil {
+		return err
+	}
+	channel, err := sharedConnectionChannel(shared)
+	if err != nil {
+		return err
+	}
+	defer channel.Close()
+	if err = channel.Confirm(false); err != nil {
+		return err
+	}
+	returned := channel.NotifyReturn(make(chan amqp091.Return, 1))
+	confirmed := channel.NotifyPublish(make(chan amqp091.Confirmation, 1))
+	closed := channel.NotifyClose(make(chan *amqp091.Error, 1))
+	if err = channel.PublishWithContext(ctx, exchange, key, true, false, amqp091.Publishing{ContentType: "application/json", DeliveryMode: amqp091.Persistent, MessageId: eventID, Body: body}); err != nil {
+		return err
+	}
+	select {
+	case confirmation, ok := <-confirmed:
+		if !ok || !confirmation.Ack {
+			return errors.New("result publication not confirmed")
+		}
+		select {
+		case <-returned:
+			return errors.New("result publication was unroutable")
+		default:
+			return nil
+		}
+	case <-closed:
+		return errors.New("result publication channel closed")
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }

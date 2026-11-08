@@ -23,7 +23,7 @@ function Assert-UnderRoot([string]$Candidate, [string]$Root) {
     if (-not $Root) { return }
     $c = Get-FullPath $Candidate; $r = Get-FullPath $Root
     if (-not $c -or -not $r) { throw "invalid path check" }
-    if ($c.Length -lt $r.Length -or ($c.Substring(0, $r.Length)).ToLower() -ne $r.ToLower()) { throw "unsafe path outside managed root: $Candidate (root=$Root)" }
+    if (-not $c.Equals($r, [System.StringComparison]::OrdinalIgnoreCase) -and -not $c.StartsWith(($r.TrimEnd([char[]]"\/") + [System.IO.Path]::DirectorySeparatorChar), [System.StringComparison]::OrdinalIgnoreCase)) { throw "unsafe path outside managed root: $Candidate (root=$Root)" }
 }
 function Ensure-Dir([string]$p) { if ($p -and -not (Test-Path -LiteralPath $p)) { New-Item -ItemType Directory -Path $p -Force | Out-Null } }
 function Unique-Dest([string]$destPath) {
@@ -67,9 +67,9 @@ function Get-VmNamesUsingDiskNumber {
     param([Parameter(Mandatory = $true)][int]$DiskNumber)
     $names = @()
     try {
-        $vms = Get-VM
+        $vms = Get-VM -ErrorAction Stop
         foreach ($v in $vms) {
-            $hdds = Get-VMHardDiskDrive -VMName $v.Name -ErrorAction SilentlyContinue
+            $hdds = Get-VMHardDiskDrive -VM $v -ErrorAction Stop
             foreach ($h in $hdds) {
                 if ($null -ne $h.DiskNumber -and $h.DiskNumber -eq $DiskNumber) {
                     $names += $v.Name
@@ -77,7 +77,7 @@ function Get-VmNamesUsingDiskNumber {
             }
         }
     }
-    catch {}
+    catch { throw "Unable to establish disk ownership on this host" }
     return $names
 }
 function Get-IscsiSessionsByDiskNumber {
@@ -137,9 +137,12 @@ try {
     }
 
     # === Résolution VM ===
-    $vm = $null
-    if ($Id) { try { $vm = Get-VM -Id $Id -ErrorAction Stop } catch {} }
-    if (-not $vm -and $Name) { try { $vm = Get-VM -Name $Name -ErrorAction Stop } catch {} }
+    # Only a successful host observation can prove absence. Transport/service
+    # errors must remain uncertain and must not release the backend reservation.
+    $observed = @(Get-VM -ErrorAction Stop)
+    $selected = if ($Id) { @($observed | Where-Object { "$($_.Id)" -eq "$Id" }) } else { @($observed | Where-Object { $_.Name -eq $Name }) }
+    if ($selected.Count -gt 1) { throw 'Ambiguous VM name; use its GUID' }
+    $vm = if ($selected.Count -eq 1) { $selected[0] } else { $null }
     if (-not $vm) {
         $result = @{
             deleted  = $false
@@ -157,8 +160,8 @@ try {
 
     # === Lister objets + chemins via Hyper-V ===
     $hddObjs = @(); $dvdObjs = @()
-    try { $hddObjs = Get-VMHardDiskDrive -VMName $vmName -ErrorAction SilentlyContinue } catch {}
-    try { $dvdObjs = Get-VMDvdDrive      -VMName $vmName -ErrorAction SilentlyContinue } catch {}
+    try { $hddObjs = Get-VMHardDiskDrive -VM $vm -ErrorAction SilentlyContinue } catch {}
+    try { $dvdObjs = Get-VMDvdDrive      -VM $vm -ErrorAction SilentlyContinue } catch {}
 
     $hddPaths = @($hddObjs | Where-Object { $_.Path } | Select-Object -Expand Path)
     $passThroughNumbers = @($hddObjs | Where-Object { $_.DiskNumber -ne $null } | Select-Object -ExpandProperty DiskNumber -Unique)
@@ -184,10 +187,10 @@ try {
     $stopped = $false
     if ($wasRunning) {
         if ($ForceStop) {
-            try { Stop-VM -Name $vmName -TurnOff -Force -ErrorAction Stop } catch { Stop-VM -Name $vmName -Force -ErrorAction Stop }
+            try { Stop-VM -VM $vm -TurnOff -Force -ErrorAction Stop } catch { Stop-VM -VM $vm -Force -ErrorAction Stop }
         }
         else {
-            try { Stop-VM -Name $vmName -Force -ErrorAction Stop } catch { throw "VM is running. Use 'forceStop: true' to force shutdown" }
+            try { Stop-VM -VM $vm -Force -ErrorAction Stop } catch { throw "VM is running. Use 'forceStop: true' to force shutdown" }
         }
         $deadline = (Get-Date).AddSeconds($WaitForStop)
         do {
@@ -200,13 +203,13 @@ try {
     # === Éjecter ISO + détacher VHD avant opérations FS ===
     foreach ($d in $dvdObjs) {
         try {
-            Set-VMDvdDrive -VMName $vmName -ControllerType $d.ControllerType -ControllerNumber $d.ControllerNumber -ControllerLocation $d.ControllerLocation -Path $null -ErrorAction SilentlyContinue
+            Set-VMDvdDrive -VMDvdDrive $d -Path $null -ErrorAction SilentlyContinue
         }
         catch {}
     }
     foreach ($h in $hddObjs) {
         try {
-            Remove-VMHardDiskDrive -VMName $vmName -ControllerType $h.ControllerType -ControllerNumber $h.ControllerNumber -ControllerLocation $h.ControllerLocation -ErrorAction SilentlyContinue
+            Remove-VMHardDiskDrive -VMHardDiskDrive $h -ErrorAction SilentlyContinue
         }
         catch {}
     }
@@ -260,7 +263,7 @@ try {
         $stillInUse = $false
         try {
             $refs = Get-VMHardDiskDrive -VMName * -ErrorAction SilentlyContinue |
-            Where-Object { $_.Path -eq $p -and $_.VMName -ne $vmName }
+            Where-Object { $_.Path -eq $p -and $_.VMId -ne $vmGuid }
             if ($refs) { $stillInUse = $true }
         }
         catch {}
@@ -301,9 +304,9 @@ try {
     }
 
     # === Supprimer la VM (config) en dernier ===
-    try { Remove-VM -Name $vmName -Force -ErrorAction Stop } catch {
+    try { Remove-VM -VM $vm -Force -ErrorAction Stop } catch {
         $vmGone = $false
-        try { $vmGone = -not (Get-VM -Name $vmName -ErrorAction SilentlyContinue) } catch {}
+        try { $remaining = @(Get-VM -ErrorAction Stop | Where-Object { "$($_.Id)" -eq $vmGuid }); $vmGone = ($remaining.Count -eq 0) } catch {}
         if (-not $vmGone) { throw }
     }
 

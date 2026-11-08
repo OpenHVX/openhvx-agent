@@ -74,3 +74,6 @@ temp/
 # --- exe
 *.exe
 config.json
+# Durable host state (must be backed up separately, never committed)
+agent-state/
+*.db
