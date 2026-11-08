@@ -58,23 +58,3 @@ This is local ACID journaling plus at-least-once transport and reconciliation, n
 a distributed ACID transaction with Hyper-V or a guarantee of automatic recovery
 from every partial host mutation. SHA-256 is a content identity, not a signature;
 RabbitMQ producer permissions and transport authentication remain required.
-
-## Tests
-
-From `src`:
-
-```bash
-go vet ./...
-go test -race ./...
-GOOS=windows GOARCH=amd64 go build -o /tmp/openhvx-agent.exe .
-```
-
-Set `AMQP_INTEGRATION_URL` to include real RabbitMQ tests. PowerShell adapter tests
-use `pwsh` on PATH or `PWSH_BINARY`; they parse real scripts and simulate Hyper-V
-cmdlets. Process-crash tests simulate host effects using fsynced test files.
-`testdata/protocol-probe` is a test helper, not a runnable production host adapter.
-
-The shared fixture `src/amqp/testdata/task-v2.json` must match the backend fixture.
-The backend integration suite can run this repository's Go helper through
-`AGENT_SOURCE_DIR` (path to this repository's `src`) or the default neighboring path.
-Actual Windows/Hyper-V crash tests and cluster failure tests are still necessary.
