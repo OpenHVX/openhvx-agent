@@ -1,193 +1,160 @@
-// consumer.go
 package amqp
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
+	"openhvx-agent/journal"
 	"time"
-
-	amqp091 "github.com/rabbitmq/amqp091-go"
 )
 
-// AfterResult est un hook optionnel appelé juste après la publication du résultat.
-// Laisse-le à nil si tu ne veux rien faire après les tasks.
-// C'est le binaire agent (main) qui peut affecter: amqp.AfterResult = func(t Task){ ... }
 var AfterResult func(Task)
 
 type Task struct {
-	TaskID        string                 `json:"taskId,omitempty"`
-	AgentID       string                 `json:"agentId,omitempty"`
-	Action        string                 `json:"action"`
-	TenantID      string                 `json:"tenantId,omitempty"` // présent pour d'autres usages, l'inventaire reste tenant-agnostic
-	Data          map[string]interface{} `json:"data,omitempty"`
-	ReplyTo       string                 `json:"replyTo,omitempty"`
-	CorrelationID string                 `json:"correlationId,omitempty"`
-	Attempt       int                    `json:"attempt,omitempty"`
-	MaxAttempts   int                    `json:"maxAttempts,omitempty"`
+	TaskID             string                 `json:"taskId,omitempty"`
+	OperationID        string                 `json:"operationId,omitempty"`
+	EventID            string                 `json:"eventId,omitempty"`
+	ContractVersion    int                    `json:"contractVersion,omitempty"`
+	CommandBody        string                 `json:"commandBody,omitempty"`
+	CommandFingerprint string                 `json:"commandFingerprint,omitempty"`
+	AgentID            string                 `json:"agentId,omitempty"`
+	Action             string                 `json:"action"`
+	TenantID           string                 `json:"tenantId,omitempty"`
+	Data               map[string]interface{} `json:"data,omitempty"`
+	CorrelationID      string                 `json:"correlationId,omitempty"`
 }
-
 type HandlerFunc func(Task) (any, error)
 
-func StartTaskConsumer(agentID string, handle HandlerFunc) error {
-	if agentID == "" {
-		return fmt.Errorf("agentID is required")
+func StartTaskConsumer(ctx context.Context, agentID string, executor *Executor) (<-chan struct{}, error) {
+	if agentID == "" || executor == nil {
+		return nil, fmt.Errorf("agent ID and durable executor required")
 	}
-	if handle == nil {
-		return fmt.Errorf("task handler is required")
-	}
-
 	if _, err := ensureChannelWithRetry(3, 2*time.Second); err != nil {
-		return fmt.Errorf("AMQP not initialized: %w", err)
+		return nil, err
 	}
-
-	go consumeLoop(agentID, handle)
-	return nil
+	done := make(chan struct{})
+	go func() { defer close(done); consumeLoop(ctx, agentID, executor) }()
+	return done, nil
 }
 
-func consumeLoop(agentID string, handle HandlerFunc) {
-	queueName := fmt.Sprintf("agent.%s.tasks", agentID)
-
-	for {
-		c, err := ensureChannelWithRetry(0, 3*time.Second)
+func consumeLoop(ctx context.Context, agentID string, executor *Executor) {
+	queue := "agent." + agentID + ".tasks"
+	for ctx.Err() == nil {
+		shared, err := ensureChannelWithRetry(3, time.Second)
 		if err != nil {
-			log.Printf("[AMQP] consumer channel error: %v (retrying in 5s)", err)
-			time.Sleep(5 * time.Second)
+			time.Sleep(time.Second)
 			continue
 		}
-
-		// Queue et binding vers l'exchange jobs (rk = agentID)
-		if _, err := c.QueueDeclare(queueName, true, false, false, false, nil); err != nil {
-			log.Printf("[AMQP] declare %s: %v", queueName, err)
-			resetConnection()
-			time.Sleep(3 * time.Second)
-			continue
-		}
-		if err := c.QueueBind(queueName, agentID, JobsEx, false, nil); err != nil {
-			log.Printf("[AMQP] bind %s to %s: %v", queueName, JobsEx, err)
-			resetConnection()
-			time.Sleep(3 * time.Second)
-			continue
-		}
-
-		// Limiter les messages non-ack en vol
-		if err := c.Qos(5, 0, false); err != nil {
-			log.Printf("[AMQP] qos error: %v", err)
-			resetConnection()
-			time.Sleep(3 * time.Second)
-			continue
-		}
-
-		msgs, err := c.Consume(
-			queueName,
-			"agent-"+agentID, // consumer tag
-			false,            // autoAck=false
-			false,            // exclusive
-			false,            // noLocal
-			false,            // noWait
-			nil,
-		)
+		// A dedicated consumer channel prevents telemetry confirms/returns from
+		// sharing acknowledgment state with command delivery.
+		c, err := sharedConnectionChannel(shared)
 		if err != nil {
-			log.Printf("[AMQP] consume setup error: %v (retrying)", err)
-			resetConnection()
-			time.Sleep(3 * time.Second)
 			continue
 		}
-
-		log.Printf("[AMQP] consuming %s ...", queueName)
-		for d := range msgs {
-			var t Task
-			if err := json.Unmarshal(d.Body, &t); err != nil {
-				log.Printf("[TASK] invalid JSON: %v", err)
-				_ = d.Nack(false, false) // drop poison
-				continue
-			}
-
-			// Ignore si le message cible un autre agent
-			if t.AgentID != "" && t.AgentID != agentID {
-				_ = d.Ack(false)
-				continue
-			}
-
-			result, hErr := handle(t)
-			ok := (hErr == nil)
-
-			if ok {
-				_ = d.Ack(false)
-			} else {
-				log.Printf("[TASK] handler error | taskId=%s action=%s agentId=%s error=%v result=%#v",
-					t.TaskID, t.Action, t.AgentID, hErr, result,
-				)
-				_ = d.Nack(false, false)
-			}
-
-			// ---- Publier le résultat sur l'exchange results ----
-			corr := t.CorrelationID
-			if corr == "" {
-				corr = t.TaskID
-			}
-
-			// Détermine l'erreur principale à publier
-			errMsg := ""
-			if m, okCast := result.(map[string]any); okCast {
-				if s, ok := m["error"].(string); ok && s != "" {
-					errMsg = s
+		invalid := queue + ".invalid"
+		_, err = c.QueueDeclare(invalid, true, false, false, false, queueOptions())
+		if err != nil {
+			c.Close()
+			time.Sleep(time.Second)
+			continue
+		}
+		_, err = c.QueueDeclare(queue, true, false, false, false, queueOptions())
+		if err == nil {
+			err = c.QueueBind(queue, agentID, JobsEx, false, nil)
+		}
+		if err != nil {
+			c.Close()
+			time.Sleep(time.Second)
+			continue
+		}
+		if err = c.Qos(1, 0, false); err != nil {
+			c.Close()
+			continue
+		}
+		messages, err := c.Consume(queue, "agent-"+agentID, false, true, false, false, nil)
+		if err != nil {
+			c.Close()
+			time.Sleep(time.Second)
+			continue
+		}
+		running := true
+		for running {
+			select {
+			case <-ctx.Done():
+				c.Close()
+				return
+			case delivery, open := <-messages:
+				if !open {
+					running = false
+					break
+				}
+				task, decodeErr := DecodeCommand(delivery.Body, agentID)
+				if decodeErr != nil {
+					// Quarantine must be confirmed before removing the poison command.
+					if err = publishConfirmed(ctx, "", invalid, delivery.Body, delivery.MessageId); err != nil {
+						delivery.Nack(false, true)
+						c.Close()
+						running = false
+						break
+					}
+					delivery.Ack(false)
+					log.Printf("[TASK] invalid command quarantined")
+					continue
+				}
+				result, execErr := executor.Execute(task)
+				if execErr != nil {
+					// Journal failures never permit an untracked host effect. Identity
+					// conflicts remain poison, all other failures are retried safely.
+					if isJournalConflict(execErr) {
+						err = publishConfirmed(ctx, "", invalid, delivery.Body, delivery.MessageId)
+						if err == nil {
+							delivery.Ack(false)
+							continue
+						}
+					}
+					delivery.Nack(false, true)
+					c.Close()
+					running = false
+					time.Sleep(time.Second)
+					break
+				}
+				if err = PublishTaskResult(ctx, result); err != nil {
+					delivery.Nack(false, true)
+					c.Close()
+					running = false
+					time.Sleep(time.Second)
+					break
+				}
+				if err = executor.MarkPublished(result); err != nil {
+					delivery.Nack(false, true)
+					c.Close()
+					running = false
+					break
+				}
+				if err = delivery.Ack(false); err != nil {
+					c.Close()
+					running = false
+					break
+				}
+				if AfterResult != nil {
+					AfterResult(task)
 				}
 			}
-			if errMsg == "" && hErr != nil {
-				errMsg = hErr.Error()
-			}
-
-			res := map[string]any{
-				"taskId":     t.TaskID,
-				"agentId":    agentID,
-				"ok":         ok,
-				"result":     result,
-				"error":      errMsg,
-				"finishedAt": time.Now().UTC().Format(time.RFC3339),
-			}
-
-			b, _ := json.Marshal(res)
-
-			rk := "task." + t.TaskID
-			if err := c.Publish(
-				ResultsEx, rk,
-				true,  // mandatory
-				false, // immediate
-				amqp091.Publishing{
-					ContentType:   "application/json",
-					DeliveryMode:  amqp091.Persistent,
-					CorrelationId: corr,
-					Body:          b,
-				},
-			); err != nil {
-				log.Printf("[AMQP] publish result (exchange) error: %v", err)
-			}
-
-			// ---- Optionnel: compat queue replyTo ----
-			if t.ReplyTo != "" {
-				_, _ = c.QueueDeclare(t.ReplyTo, true, false, false, false, nil)
-				if err := c.Publish(
-					"", t.ReplyTo,
-					true,
-					false,
-					amqp091.Publishing{
-						ContentType:   "application/json",
-						DeliveryMode:  amqp091.Persistent,
-						CorrelationId: corr,
-						Body:          b,
-					},
-				); err != nil {
-					log.Printf("[AMQP] publish result (replyTo) error: %v", err)
-				}
-			}
-
-			// ---- Hook post-publication (ex: déclencher inventory.refresh.light) ----
-			if AfterResult != nil {
-				go AfterResult(t) // non bloquant
-			}
 		}
-		log.Printf("[AMQP] consumer stopped for %s (channel closed?), retrying...", queueName)
-		time.Sleep(2 * time.Second)
+		c.Close()
 	}
 }
+func PublishTaskResult(ctx context.Context, body json.RawMessage) error {
+	var identity struct {
+		TaskID  string `json:"taskId"`
+		EventID string `json:"eventId"`
+	}
+	if err := json.Unmarshal(body, &identity); err != nil {
+		return err
+	}
+	return publishConfirmed(ctx, ResultsEx, "task."+identity.TaskID, body, identity.EventID)
+}
+
+func isJournalConflict(err error) bool { return errors.Is(err, journal.ErrConflict) }

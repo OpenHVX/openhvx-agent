@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -99,7 +100,12 @@ func main() {
 	}
 
 	logf("pipe=%s", *flagPipe)
-	logf("ws=%s", *flagWS)
+	if address, err := url.Parse(*flagWS); err == nil {
+		address.User = nil
+		address.RawQuery = ""
+		address.Fragment = ""
+		logf("ws=%s", address.String())
+	}
 	if *flagTTL > 0 {
 		logf("ttl=%ds", *flagTTL)
 	}

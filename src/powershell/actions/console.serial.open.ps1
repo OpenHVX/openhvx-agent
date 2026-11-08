@@ -28,7 +28,7 @@ function Get-VmGuidFrom($payload) {
 
 function Get-Com1PipePath([string]$vmGuid) {
     try { $vm = Get-VM -Id $vmGuid -ErrorAction Stop } catch { throw "VM not by GUID Hyper-V: $vmGuid" }
-    try { $com = Get-VMComPort -VMName $vm.Name -Number 1 -ErrorAction Stop } catch { throw "Impossible to read COM1 of '$($vm.Name)'" }
+    try { $com = Get-VMComPort -VM $vm -Number 1 -ErrorAction Stop } catch { throw "Impossible to read COM1 of '$($vm.Name)'" }
     $path = [string]$com.Path
     if (-not $path) { throw "no COM1 configured. Configure a Named Pipe on '$($vm.Name)'." }
     if ($path -notmatch '^\\\\\.\\pipe\\') { throw "COM1 n'est pas un Named Pipe (Path=$path)." }

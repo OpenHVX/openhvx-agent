@@ -136,7 +136,7 @@ function Assert-UnderRoot {
     $c = Get-FullPath $Candidate
     $r = Get-FullPath $Root
     if (-not $c -or -not $r) { throw "invalid path check" }
-    if ($c.Length -lt $r.Length -or ($c.Substring(0, $r.Length)).ToLower() -ne $r.ToLower()) {
+    if (-not $c.Equals($r, [System.StringComparison]::OrdinalIgnoreCase) -and -not $c.StartsWith(($r.TrimEnd([char[]]"\/") + [System.IO.Path]::DirectorySeparatorChar), [System.StringComparison]::OrdinalIgnoreCase)) {
         throw "unsafe path outside managed root: $Candidate (root=$Root)"
     }
 }
@@ -256,9 +256,9 @@ function Get-VmNamesUsingDiskNumber {
     param([Parameter(Mandatory = $true)][int]$DiskNumber)
     $names = @()
     try {
-        $vms = Get-VM
+        $vms = Get-VM -ErrorAction Stop
         foreach ($v in $vms) {
-            $hdds = Get-VMHardDiskDrive -VMName $v.Name -ErrorAction SilentlyContinue
+            $hdds = Get-VMHardDiskDrive -VM $v -ErrorAction Stop
             foreach ($h in $hdds) {
                 if ($null -ne $h.DiskNumber -and $h.DiskNumber -eq $DiskNumber) {
                     $names += $v.Name
@@ -266,7 +266,7 @@ function Get-VmNamesUsingDiskNumber {
             }
         }
     }
-    catch {}
+    catch { throw "Unable to establish disk ownership on this host" }
     return $names
 }
 function Disconnect-IscsiTargetSafe {
@@ -442,6 +442,10 @@ try {
 
     if ([string]::IsNullOrWhiteSpace($d.name)) { throw "missing 'name'" }
     $Name = $d.name.Trim()
+    $operationId = $d.__operation.operationId
+    $commandFingerprint = $d.__operation.commandFingerprint
+    if ($operationId -notmatch '^[a-zA-Z0-9-]{1,128}$' -or $commandFingerprint -notmatch '^[a-f0-9]{64}$') { throw 'Durable operation identity required' }
+
     $Generation = if ($d.generation) { [int]$d.generation } else { 2 }
     if ($Generation -notin 1, 2) { throw "invalid 'generation' (must be 1 or 2)" }
 
@@ -589,9 +593,13 @@ try {
     if ($VmDir) { $vmParams.Path = $VmDir }
     if ($SwitchName) { $vmParams.SwitchName = $SwitchName }
 
+    # Stable operation path permits observation after a crash; no recreation.
+    if ($VmDir) { $vmParams.Path = Join-Path $VmDir $operationId }
     $vm = New-VM @vmParams -ErrorAction Stop
     $createdVm = $vm
     $createdVmName = $vm.Name
+    Set-VM -VM $vm -Notes "OpenHVX operation=$operationId hash=$commandFingerprint phase=applying" -ErrorAction Stop | Out-Null
+
 
     if ($CPU -and $CPU -ge 1) {
         Set-VM -VM $vm -ProcessorCount $CPU -ErrorAction Stop | Out-Null
@@ -615,16 +623,16 @@ try {
     # ----- COM1 (Named Pipe) AVANT 1er boot -----
     $vmGuid = $vm.Id.Guid
     $com1Path = "\\.\pipe\openhvx-$vmGuid-com1"
-    Set-VMComPort -VMName $Name -Number 1 -Path $com1Path | Out-Null
+    Set-VMComPort -VM $vm -Number 1 -Path $com1Path | Out-Null
     $notes.Add("COM1 named pipe configured: $com1Path") | Out-Null
 
     # Firmware (Secure Boot) pour Gen2
     if ($Generation -eq 2) {
         if ($SecureBoot) {
-            Set-VMFirmware -VMName $Name -EnableSecureBoot On -SecureBootTemplate "MicrosoftUEFICertificateAuthority" | Out-Null
+            Set-VMFirmware -VM $vm -EnableSecureBoot On -SecureBootTemplate "MicrosoftUEFICertificateAuthority" | Out-Null
         }
         else {
-            Set-VMFirmware -VMName $Name -EnableSecureBoot Off | Out-Null
+            Set-VMFirmware -VM $vm -EnableSecureBoot Off | Out-Null
         }
     }
 
@@ -653,7 +661,7 @@ try {
         if (-not $iscsiDisk.IsOffline) { Set-Disk -Number $iscsiDisk.Number -IsOffline $true | Out-Null }
 
         $controllerType = if ($Generation -eq 1) { "IDE" } else { "SCSI" }
-        Add-VMHardDiskDrive -VMName $Name -DiskNumber $iscsiDisk.Number -ControllerType $controllerType | Out-Null
+        Add-VMHardDiskDrive -VM $vm -DiskNumber $iscsiDisk.Number -ControllerType $controllerType | Out-Null
         $passThroughAttached = $true
         Write-DebugLog -Message "iscsi disk attached number=$($iscsiDisk.Number) controller=$controllerType" -Ctx $ctx
         $portalNote = if ($IscsiPortal) { " via $IscsiPortal" } else { "" }
@@ -668,22 +676,22 @@ try {
 
     New-SeedIso -filesDir $tmp -isoPath $SeedIso
     $createdSeedIso = $SeedIso
-    Add-VMDvdDrive -VMName $Name -Path $SeedIso | Out-Null
+    Add-VMDvdDrive -VM $vm -Path $SeedIso | Out-Null
     Remove-Item -Path $tmp -Recurse -Force
     Write-DebugLog -Message "seed iso attached path=$SeedIso" -Ctx $ctx
 
     # Ordre de boot (Gen2)
     if ($Generation -eq 2) {
         $sys = if ($UseIscsi) {
-            Get-VMHardDiskDrive -VMName $Name | Where-Object { $_.DiskNumber -eq $iscsiDisk.Number }
+            Get-VMHardDiskDrive -VM $vm | Where-Object { $_.DiskNumber -eq $iscsiDisk.Number }
         }
         else {
-            Get-VMHardDiskDrive -VMName $Name | Where-Object { $_.Path -eq $VmVhdx }
+            Get-VMHardDiskDrive -VM $vm | Where-Object { $_.Path -eq $VmVhdx }
         }
-        if ($sys) { Set-VMFirmware -VMName $Name -FirstBootDevice $sys | Out-Null }
+        if ($sys) { Set-VMFirmware -VM $vm -FirstBootDevice $sys | Out-Null }
     }
 
-    Start-VM -Name $Name | Out-Null
+    Start-VM -VM $vm | Out-Null
     Write-DebugLog -Message "vm started name=$Name" -Ctx $ctx
 
     $disks = @()
@@ -737,6 +745,8 @@ try {
     $payload = @{ vm = $vmObj }
     if ($notes.Count -gt 0) { $payload.notes = $notes }
 
+    # Final marker is written only after all required host steps succeeded.
+    Set-VM -VM $vm -Notes "OpenHVX operation=$operationId hash=$commandFingerprint phase=complete" -ErrorAction Stop | Out-Null
     $payload | ConvertTo-Json -Depth 10
     exit 0
 }
@@ -747,14 +757,14 @@ catch {
 
     try {
         if ($passThroughAttached -and $createdVmName -and $iscsiDiskNumber -ne $null) {
-            Remove-VMHardDiskDrive -VMName $createdVmName -DiskNumber $iscsiDiskNumber -ErrorAction SilentlyContinue | Out-Null
+            Get-VMHardDiskDrive -VM $createdVm -ErrorAction SilentlyContinue | Where-Object { $_.DiskNumber -eq $iscsiDiskNumber } | Remove-VMHardDiskDrive -ErrorAction SilentlyContinue | Out-Null
         }
     }
     catch {}
     try {
-        if ($createdVmName -and (Get-VM -Name $createdVmName -ErrorAction SilentlyContinue)) {
-            Stop-VM -Name $createdVmName -TurnOff -Force -ErrorAction SilentlyContinue | Out-Null
-            Remove-VM -Name $createdVmName -Force -ErrorAction SilentlyContinue | Out-Null
+        if ($createdVm -and (Get-VM -Id $createdVm.Id -ErrorAction SilentlyContinue)) {
+            Stop-VM -VM $createdVm -TurnOff -Force -ErrorAction SilentlyContinue | Out-Null
+            Remove-VM -VM $createdVm -Force -ErrorAction SilentlyContinue | Out-Null
         }
     }
     catch {}

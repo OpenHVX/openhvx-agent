@@ -6,6 +6,7 @@ import (
 )
 
 type Config struct {
+	JournalPath          string   `json:"journalPath"`
 	AgentID              string   `json:"agentId"`
 	RabbitMQURL          string   `json:"rabbitmqUrl"`          // ⚠️ clé JSON en camelCase
 	HeartbeatIntervalSec int      `json:"heartbeatIntervalSec"` // ex: 30

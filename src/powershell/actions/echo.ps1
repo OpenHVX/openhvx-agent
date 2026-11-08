@@ -1,3 +1,4 @@
+param([string]$InputJson)
 # src/powershell/actions/echo.ps1
 # Lit un JSON sur STDIN du type:
 #   { "action": "echo", "data": { ... } }

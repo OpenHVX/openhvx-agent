@@ -2,13 +2,25 @@
 
 Agent that executes Hyper-V actions with PowerShell and communicates with the Controller over AMQP (RabbitMQ).
 
+See [durable task execution v2](docs/task-protocol-v2.md) for the journal, compatibility, recovery and tests.
+
 ## Setup
 
-### Build & move `openhvx-cloudinit-iso.exe`
+### Build `openhvx-cidata-iso.exe`
 Place the helper binary under `src/powershell/bin`:
 
 ```powershell
-cd tools/cloudinit-iso/src && go build && mv ./openhvx-cloudinit-iso.exe ../../../src/powershell/bin
+cd tools/cloudinit-iso/src
+New-Item -ItemType Directory -Force ../../../src/powershell/bin | Out-Null
+go build -o ../../../src/powershell/bin/openhvx-cidata-iso.exe .
+```
+
+### Build the serial console helper
+
+```powershell
+cd tools/serial-bridge/src
+New-Item -ItemType Directory -Force ../../../src/powershell/bin | Out-Null
+go build -o ../../../src/powershell/bin/openhvx-serial-bridge.exe .
 ```
 
 ### Configure the agent
@@ -21,6 +33,7 @@ Create `src/config.json` before starting the service. Example:
   "heartbeatIntervalSec": 60,
   "inventoryIntervalSec": 120,
   "basePath": "D:\\DATA",
+  "journalPath": "D:\\DATA\\agent-state\\operations.db",
   "capabilities": [
     "inventory",
     "vm.power",

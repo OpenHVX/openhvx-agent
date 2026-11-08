@@ -7,8 +7,10 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"openhvx-agent/journal"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -141,6 +143,27 @@ func main() {
 	}
 	tasks.SetRuntimeContext(cfg.AgentID, cfg.BasePath, dirs)
 	dsParam := buildDatastoresParam(dirs)
+	if cfg.JournalPath == "" {
+		if cfg.BasePath == "" {
+			log.Fatal("journalPath or basePath required for durable execution")
+		}
+		cfg.JournalPath = filepath.Join(cfg.BasePath, "agent-state", "operations.db")
+	}
+	if !filepath.IsAbs(cfg.JournalPath) {
+		log.Fatal("journalPath must be absolute and stable across restarts")
+	}
+	store, err := journal.Open(cfg.JournalPath)
+	if err != nil {
+		log.Fatalf("journal open failed: %v", err)
+	}
+	defer store.Close()
+	if err = store.BindAgent(cfg.AgentID); err != nil {
+		log.Fatal("journal identity does not match configured agent")
+	}
+	executor := amqp.NewExecutor(store, cfg.AgentID, tasks.HandleTask, tasks.RecoverTask)
+	cfg.Capabilities = append(cfg.Capabilities, amqp.ProtocolCapability)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	// 2) AMQP
 	if err := amqp.InitPublisher(cfg.RabbitMQURL); err != nil {
@@ -209,15 +232,45 @@ func main() {
 	}()
 
 	// 4) Consumer des tâches -> tasks.HandleTask (injecte __ctx pour les scripts)
-	if err := amqp.StartTaskConsumer(cfg.AgentID, tasks.HandleTask); err != nil {
+	consumerDone, err := amqp.StartTaskConsumer(ctx, cfg.AgentID, executor)
+	if err != nil {
 		log.Fatalf("start consumer failed: %v", err)
 	}
 
-	log.Printf("started | agentId=%s rmq=%s", cfg.AgentID, cfg.RabbitMQURL)
+	go func() {
+		ticker := time.NewTicker(15 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				results, err := executor.Reconcile()
+				if err != nil {
+					log.Printf("journal reconciliation failed")
+					continue
+				}
+				for _, result := range results {
+					if err = amqp.PublishTaskResult(ctx, result); err != nil {
+						log.Printf("reconciled result delivery deferred")
+					} else if err = executor.MarkPublished(result); err != nil {
+						log.Printf("journal result confirmation deferred")
+					}
+				}
+			}
+		}
+	}()
+	log.Printf("started | agentId=%s", cfg.AgentID)
 
 	// Arrêt propre (CTRL+C / SIGTERM)
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 	<-stop
 	log.Println("shutting down...")
+	cancel()
+	select {
+	case <-consumerDone:
+	case <-time.After(30 * time.Second):
+		log.Println("shutdown deadline reached; pending operations will be reconciled")
+	}
 }
